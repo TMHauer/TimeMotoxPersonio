@@ -3,8 +3,10 @@ export type Env = {
   SHADOW_MODE: boolean;
   ALLOW_INVALID_SIGNATURE: boolean;
 
-  ADMIN_TOKEN: string;
+  // NEW: auth via URL path token
+  WEBHOOK_PATH_TOKEN: string;
 
+  ADMIN_TOKEN: string;
   TIMEMOTO_WEBHOOK_SECRET: string;
 
   PERSONIO_CLIENT_ID: string;
@@ -34,8 +36,9 @@ export function loadEnv(): Env {
     SHADOW_MODE: bool(opt("SHADOW_MODE", "true")),
     ALLOW_INVALID_SIGNATURE: bool(opt("ALLOW_INVALID_SIGNATURE", "false")),
 
-    ADMIN_TOKEN: req("ADMIN_TOKEN"),
+    WEBHOOK_PATH_TOKEN: req("WEBHOOK_PATH_TOKEN"),
 
+    ADMIN_TOKEN: req("ADMIN_TOKEN"),
     TIMEMOTO_WEBHOOK_SECRET: req("TIMEMOTO_WEBHOOK_SECRET"),
 
     PERSONIO_CLIENT_ID: req("PERSONIO_CLIENT_ID"),
