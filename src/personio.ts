@@ -29,7 +29,8 @@ export async function getPersonioToken(env: Env, redis: Redis): Promise<string> 
   // Robust: use x-www-form-urlencoded to avoid 415 Unsupported Media Type :contentReference[oaicite:1]{index=1}
   const body = formEncode({
     client_id: env.PERSONIO_CLIENT_ID,
-    client_secret: env.PERSONIO_CLIENT_SECRET
+    client_secret: env.PERSONIO_CLIENT_SECRET,
+    grant_type: "client_credentials"
   });
 
   const r = await personioFetch(env, "/v2/auth/token", {
