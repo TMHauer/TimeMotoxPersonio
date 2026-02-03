@@ -88,12 +88,15 @@ function zonedLocalToUtcDate(
 }
 
 /**
- * Robust, secret-based signature validation:
- * Tries multiple common provider variants:
- * - HMAC-SHA256(secret, rawBody)  -> hex/base64/base64url
- * - SHA256(rawBody + secret)      -> hex
- * - SHA256(secret + rawBody)      -> hex
- * Supports header formats:
+ * Robust signature validation:
+ * - Supports hex / base64 / base64url output
+ * - Supports keys interpreted as:
+ *   - UTF-8 string
+ *   - base64-decoded bytes (if applicable)
+ *   - hex-decoded bytes (if applicable)
+ * - Also tries SHA256(secret+body) and SHA256(body+secret) (hex) as compatibility fallback.
+ *
+ * Header formats supported:
  * - "<sig>"
  * - "sha256=<sig>"
  * - "t=...,v1=<sig>"
@@ -110,7 +113,7 @@ export function verifyTimemotoSignature(rawBody: Buffer, signatureHeader: string
   return candidates.some((c) => signatureEquals(provided, c));
 }
 
-// Minimal debug info WITHOUT leaking secrets/body/signature
+// Minimal debug info WITHOUT leaking secrets/body/signature contents
 export function signatureDebugInfo(rawBody: Buffer, signatureHeader: string | undefined | null, secret: string) {
   const provided = signatureHeader ? extractSignatureToken(signatureHeader) : null;
   const candidates = computeCandidates(rawBody, secret);
@@ -119,24 +122,72 @@ export function signatureDebugInfo(rawBody: Buffer, signatureHeader: string | un
     sigLen: provided ? provided.length : 0,
     sigPrefix: provided ? provided.slice(0, 6) : null,
     bodyLen: rawBody?.length ?? 0,
-    candPrefixes: candidates.slice(0, 3).map((c) => c.slice(0, 6)) // show only a few prefixes
+    candPrefixes: candidates.slice(0, 5).map((c) => c.slice(0, 6))
   };
 }
 
 function computeCandidates(rawBody: Buffer, secret: string): string[] {
   const cand: string[] = [];
 
-  const hmacBytes = crypto.createHmac("sha256", secret).update(rawBody).digest();
-  cand.push(hmacBytes.toString("hex"));
-  cand.push(hmacBytes.toString("base64"));
-  cand.push(toBase64UrlNoPad(hmacBytes.toString("base64")));
+  // Key variants: utf8, base64-decoded, hex-decoded
+  const keys: Buffer[] = [];
+  keys.push(Buffer.from(secret, "utf8"));
 
-  const sha1 = crypto.createHash("sha256").update(Buffer.concat([rawBody, Buffer.from(secret, "utf8")])).digest("hex");
-  const sha2 = crypto.createHash("sha256").update(Buffer.concat([Buffer.from(secret, "utf8"), rawBody])).digest("hex");
-  cand.push(sha1);
-  cand.push(sha2);
+  const b64 = tryDecodeBase64(secret);
+  if (b64) keys.push(b64);
 
-  return cand;
+  const hex = tryDecodeHex(secret);
+  if (hex) keys.push(hex);
+
+  // HMAC variants for each key
+  for (const key of keys) {
+    const hmacBytes = crypto.createHmac("sha256", key).update(rawBody).digest();
+    cand.push(hmacBytes.toString("hex"));
+    cand.push(hmacBytes.toString("base64"));
+    cand.push(toBase64UrlNoPad(hmacBytes.toString("base64")));
+  }
+
+  // Compatibility fallback (still secret-protected, but not ideal)
+  cand.push(
+    crypto.createHash("sha256").update(Buffer.concat([rawBody, Buffer.from(secret, "utf8")])).digest("hex")
+  );
+  cand.push(
+    crypto.createHash("sha256").update(Buffer.concat([Buffer.from(secret, "utf8"), rawBody])).digest("hex")
+  );
+
+  return uniq(cand);
+}
+
+function uniq(arr: string[]): string[] {
+  const s = new Set<string>();
+  for (const a of arr) s.add(a);
+  return Array.from(s);
+}
+
+function tryDecodeHex(s: string): Buffer | null {
+  const v = s.trim();
+  if (!/^[0-9a-fA-F]+$/.test(v)) return null;
+  if (v.length % 2 !== 0) return null;
+  try {
+    const b = Buffer.from(v, "hex");
+    return b.length > 0 ? b : null;
+  } catch {
+    return null;
+  }
+}
+
+function tryDecodeBase64(s: string): Buffer | null {
+  const v = s.trim();
+  // very permissive: only attempt if it looks like base64-ish
+  if (!/^[A-Za-z0-9+/=_-]+$/.test(v)) return null;
+  try {
+    const std = v.replace(/-/g, "+").replace(/_/g, "/");
+    const pad = std.length % 4 === 0 ? std : std + "=".repeat(4 - (std.length % 4));
+    const b = Buffer.from(pad, "base64");
+    return b.length > 0 ? b : null;
+  } catch {
+    return null;
+  }
 }
 
 function extractSignatureToken(headerValue: string): string | null {
@@ -177,8 +228,10 @@ function signatureEquals(providedRaw: string, expectedRaw: string): boolean {
 function normalizeSig(s: string): string {
   const v = s.trim();
 
+  // hex digest (64 chars) -> normalize to lowercase
   if (/^[0-9a-fA-F]{64}$/.test(v)) return v.toLowerCase();
 
+  // base64/base64url -> normalize (urlsafe -> std, remove padding)
   const std = v.replace(/-/g, "+").replace(/_/g, "/");
   return std.replace(/=+$/g, "");
 }
