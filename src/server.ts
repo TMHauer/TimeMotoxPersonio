@@ -13,7 +13,6 @@ const redis = createRedis(env);
 const app = express();
 
 function getSignatureHeader(req: Request): string | undefined {
-  // Express headers are case-insensitive
   return (
     req.header("timemoto-signature") ??
     req.header("x-timemoto-signature") ??
@@ -28,16 +27,23 @@ app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true, ts: new Date().toISOString(), shadow: env.SHADOW_MODE });
 });
 
-// Basic connectivity check (no secrets returned)
 app.get("/health/deps", async (_req: Request, res: Response) => {
   try {
-    // Redis ping-ish
-    await redis.set("health:ping", "1", { ex: 30 });
-    const v = await redis.get("health:ping");
+    const key = `health:ping:${Math.random().toString(16).slice(2)}`;
+    const wrote = await redis.set(key, "1", { ex: 30 });
+    const got = await redis.get(key);
+
+    const gotStr = got === null || got === undefined ? null : String(got);
+    const okRedis = wrote === "OK" && gotStr === "1";
 
     res.json({
       ok: true,
-      redis: v === "1" ? "ok" : "warn",
+      redis: okRedis ? "ok" : "warn",
+      details: {
+        wrote,
+        gotType: got === null ? "null" : typeof got,
+        gotStr
+      },
       shadow: env.SHADOW_MODE
     });
   } catch (e: any) {
@@ -45,7 +51,6 @@ app.get("/health/deps", async (_req: Request, res: Response) => {
   }
 });
 
-// Webhook: keep RAW bytes for signature verification
 app.post(
   "/webhook/timemoto",
   express.raw({ type: "*/*" }),
@@ -53,7 +58,6 @@ app.post(
     const raw = req.body as Buffer;
     const sig = getSignatureHeader(req);
 
-    // parse JSON first to detect "test" events (some providers sign them differently)
     let body: any = null;
     try {
       body = JSON.parse(raw.toString("utf8"));
@@ -62,7 +66,6 @@ app.post(
       return res.status(400).json({ ok: false, code: "INVALID_JSON" });
     }
 
-    // Optional: allow unsigned TimeMoto "test" events (keeps production secure)
     if (body?.event === "test") {
       log("info", "webhook.test_event_received");
       return res.json({ ok: true });
