@@ -1,5 +1,5 @@
 import { Redis } from "@upstash/redis";
-import type { Env } from "./env";
+import type { Env } from "./env.js";
 
 export function createRedis(env: Env) {
   return new Redis({
