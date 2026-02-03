@@ -8,7 +8,6 @@ export function normalizeEmail(v: string): string {
 export function extractEmailFromEvent(body: any): string | null {
   const n = body?.data?.userEmployeeNumber;
   if (typeof n === "string" && n.includes("@")) return normalizeEmail(n);
-  // fallback (less ideal)
   const e = body?.data?.emailAddress;
   if (typeof e === "string" && e.includes("@")) return normalizeEmail(e);
   return null;
@@ -16,21 +15,23 @@ export function extractEmailFromEvent(body: any): string | null {
 
 export function extractStampUtcMillis(body: any): number | null {
   const tz = (typeof body?.data?.timeZone === "string" && body.data.timeZone) || "Europe/Berlin";
+
+  // IMPORTANT:
+  // Prefer non-rounded time first to avoid duplicate_punch when the provider re-sends rounded timestamps.
   const iso =
-    body?.data?.timeLoggedRounded ??
     body?.data?.timeLogged ??
-    body?.data?.timeInserted;
+    body?.data?.timeInserted ??
+    body?.data?.timeLoggedRounded;
 
   if (typeof iso !== "string") return null;
 
-  // timeLogged often has no offset -> interpret in provided timeZone
-  // timeInserted is usually Z -> Luxon handles it fine
   const dt = DateTime.fromISO(iso, { zone: tz });
   if (!dt.isValid) return null;
   return dt.toUTC().toMillis();
 }
 
 export function toBerlinISO(utcMillis: number): string {
+  // keep as ISO with offset for logs/session; Personio formatting is handled in personio.ts now
   return DateTime.fromMillis(utcMillis, { zone: "utc" })
     .setZone("Europe/Berlin")
     .toISO({ suppressMilliseconds: true }) as string;
@@ -63,7 +64,6 @@ function base64ToBuf(s: string): Buffer | null {
 }
 
 function stripSigPrefix(sig: string): string {
-  // allow common formats like "sha256=...."
   return String(sig ?? "")
     .trim()
     .replace(/^sha256=/i, "")
@@ -75,17 +75,13 @@ export function verifyTimemotoSignature(rawBody: Buffer, headerSig: string, secr
   if (!sig) return false;
 
   const candidates: Buffer[] = [];
-
-  // 1) secret as utf8
   candidates.push(Buffer.from(secret, "utf8"));
 
-  // 2) secret as base64 decoded (common gotcha)
   if (looksBase64(secret)) {
     const b = base64ToBuf(secret);
     if (b && b.length > 0) candidates.push(b);
   }
 
-  // 3) secret as hex decoded
   if (/^[0-9a-fA-F]+$/.test(secret) && secret.length % 2 === 0) {
     try {
       candidates.push(Buffer.from(secret, "hex"));
@@ -94,28 +90,21 @@ export function verifyTimemotoSignature(rawBody: Buffer, headerSig: string, secr
     }
   }
 
-  // Compare against different signature schemes that vendors sometimes use:
   for (const key of candidates) {
-    // A) HMAC-SHA256 -> hex
     const hHex = crypto.createHmac("sha256", key).update(rawBody).digest("hex");
     if (timingSafeEq(hHex.toLowerCase(), sig.toLowerCase())) return true;
 
-    // B) HMAC-SHA256 -> base64
     const hB64 = crypto.createHmac("sha256", key).update(rawBody).digest("base64");
     if (timingSafeEq(hB64, sig)) return true;
 
-    // C) HMAC-SHA256 -> base64url
     const hB64Url = hB64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
     if (timingSafeEq(hB64Url, sig)) return true;
 
-    // D) Some vendors use sha256(secret + body) (NOT HMAC) -> hex
-    const sPlusBody = Buffer.concat([key, rawBody]);
-    const sha1 = crypto.createHash("sha256").update(sPlusBody).digest("hex");
+    // non-HMAC fallbacks some vendors use
+    const sha1 = crypto.createHash("sha256").update(Buffer.concat([key, rawBody])).digest("hex");
     if (timingSafeEq(sha1.toLowerCase(), sig.toLowerCase())) return true;
 
-    // E) Some vendors use sha256(body + secret) (NOT HMAC) -> hex
-    const bodyPlusS = Buffer.concat([rawBody, key]);
-    const sha2 = crypto.createHash("sha256").update(bodyPlusS).digest("hex");
+    const sha2 = crypto.createHash("sha256").update(Buffer.concat([rawBody, key])).digest("hex");
     if (timingSafeEq(sha2.toLowerCase(), sig.toLowerCase())) return true;
   }
 
