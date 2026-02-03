@@ -1,6 +1,11 @@
 import type { Env } from "./env.js";
 import { log } from "./log.js";
-import { normalizeEmail, extractStampUtc, toBerlinISO, berlinDayEndUtcMillis } from "./timemoto.js";
+import {
+  normalizeEmail,
+  extractStampUtc,
+  toBerlinISO,
+  berlinDayEndUtcMillis
+} from "./timemoto.js";
 import { getEmployeeIdByEmail, createAttendance, patchAttendanceEnd } from "./personio.js";
 import { recordAnomaly } from "./anomalies.js";
 import { getOpenSession, setOpenSession, clearOpenSession } from "./session.js";
@@ -29,34 +34,37 @@ type OpenSession = {
 
 const IDEMP_KEY = (eventId: string) => `idemp:${eventId}`;
 
-function addMinutesIso(iso: string, minutes: number): string {
+function addMinutesISO(iso: string, minutes: number): string {
   const d = new Date(iso);
-  const ms = d.getTime();
-  return new Date(ms + minutes * 60_000).toISOString();
+  return new Date(d.getTime() + minutes * 60_000).toISOString();
 }
 
 function minIso(a: string, b: string): string {
   return new Date(a).getTime() <= new Date(b).getTime() ? a : b;
 }
 
-/**
- * Idempotency claim using Redis SET NX PX
- * Fixes TS overload issue by using positional args order supported by ioredis:
- * redis.set(key, value, "PX", ttlMs, "NX")
- */
 async function claimEvent(redis: RedisLike, eventId: string): Promise<boolean> {
-  const ttlMs = 14 * 24 * 3600_000; // 14 days
-  const res = await redis.set(IDEMP_KEY(eventId), "1", "PX", ttlMs, "NX");
-  return res === "OK";
+  // Use "any" to be compatible with Upstash or ioredis typings
+  const r: any = redis as any;
+  const ttlSeconds = 14 * 24 * 3600;
+
+  // Try Upstash style: set(key, val, { nx:true, ex: ttl })
+  try {
+    const res = await r.set(IDEMP_KEY(eventId), "1", { nx: true, ex: ttlSeconds });
+    return res === "OK" || res === true;
+  } catch {
+    // Fallback ioredis style: set(key, val, "EX", ttl, "NX")
+    const res = await r.set(IDEMP_KEY(eventId), "1", "EX", ttlSeconds, "NX");
+    return res === "OK";
+  }
 }
 
 function computeAutoClose(stampUtc: Date): { autoCloseAtUtcMs: number; autoCloseAtBerlinISO: string } {
   const startMs = stampUtc.getTime();
   const max12h = startMs + 12 * 3600_000;
-  const dayEnd = berlinDayEndUtcMillis(stampUtc); // returns UTC millis for 23:59 Berlin
-  const autoCloseAtUtcMs = Math.min(max12h, dayEnd);
-  const autoCloseAtBerlinISO = toBerlinISO(new Date(autoCloseAtUtcMs));
-  return { autoCloseAtUtcMs, autoCloseAtBerlinISO };
+  const dayEndMs = berlinDayEndUtcMillis(stampUtc); // accepts Date|number now
+  const autoCloseAtUtcMs = Math.min(max12h, dayEndMs);
+  return { autoCloseAtUtcMs, autoCloseAtBerlinISO: toBerlinISO(new Date(autoCloseAtUtcMs)) };
 }
 
 export async function handleAttendance(env: Env, redis: RedisLike, body: TimeMotoEvent) {
@@ -65,21 +73,21 @@ export async function handleAttendance(env: Env, redis: RedisLike, body: TimeMot
     log("warn", "attendance.missing_event_id");
     await recordAnomaly(redis as any, {
       type: "EVENT_ID_MISSING",
-      email: null,
-      event_id: null,
-      details: JSON.stringify({ event: body?.event ?? null })
+      email: undefined,
+      eventId: undefined,
+      details: { event: body?.event ?? null }
     });
     return;
   }
 
-  // 1) Idempotency FIRST → prevents the duplicate processing you saw
+  // 1) Idempotency FIRST
   const first = await claimEvent(redis, eventId);
   if (!first) {
     log("info", "attendance.duplicate", { eventId });
     return;
   }
 
-  // 2) Only process attendance.inserted (IN/OUT)
+  // 2) Only attendance.inserted
   if (String(body?.event ?? "") !== "attendance.inserted") {
     log("info", "attendance.ignored", { eventId, event: body?.event });
     return;
@@ -87,7 +95,6 @@ export async function handleAttendance(env: Env, redis: RedisLike, body: TimeMot
 
   const clockingType = String(body?.data?.clockingType ?? "").toLowerCase();
 
-  // Mapping: we use userEmployeeNumber (you filled it with email)
   const email =
     normalizeEmail(String(body?.data?.userEmployeeNumber ?? "")) ??
     normalizeEmail(String(body?.data?.emailAddress ?? "")) ??
@@ -97,29 +104,24 @@ export async function handleAttendance(env: Env, redis: RedisLike, body: TimeMot
     log("warn", "attendance.email_missing", { eventId });
     await recordAnomaly(redis as any, {
       type: "EMAIL_MISSING",
-      email: null,
-      event_id: eventId,
-      details: JSON.stringify({ userId: body?.data?.userId ?? null })
+      email: undefined,
+      eventId,
+      details: { userId: body?.data?.userId ?? null }
     });
     return;
   }
 
-  const stampUtc: Date = extractStampUtc(body);
+  const stampUtc = extractStampUtc(body);
   const stampBerlinISO = toBerlinISO(stampUtc);
 
-  // -----------------------
   // IN
-  // -----------------------
   if (clockingType === "in") {
     const existing: OpenSession | null = await getOpenSession(redis as any, email);
 
-    // DOUBLE-IN: close previous session at prevStart+60min (or earlier if needed)
     if (existing) {
-      const closeAt = addMinutesIso(existing.startBerlinISO, 60);
+      const closeAt = addMinutesISO(existing.startBerlinISO, 60);
       log("warn", "attendance.double_in", { email, prevStart: existing.startBerlinISO, closeAt });
 
-      // ensure Personio period exists for previous session:
-      // We patch the existing period end (preferred) to avoid duplicates.
       try {
         await patchAttendanceEnd(env, redis as any, existing.personioPeriodId, closeAt);
       } catch (e: any) {
@@ -129,22 +131,20 @@ export async function handleAttendance(env: Env, redis: RedisLike, body: TimeMot
       await clearOpenSession(redis as any, email);
     }
 
-    // Resolve employeeId by email (cached)
     const employeeId = await getEmployeeIdByEmail(env, redis as any, email);
     if (!employeeId) {
       log("warn", "personio.employee_not_found", { email });
       await recordAnomaly(redis as any, {
         type: "PERSONIO_NOT_FOUND",
         email,
-        event_id: eventId,
-        details: JSON.stringify({})
+        eventId,
+        details: {}
       });
       return;
     }
 
-    // Create period with a placeholder end (+1 min), then we patch on OUT/autoclose.
-    const placeholderEnd = addMinutesIso(stampBerlinISO, 1);
-    const personioPeriodId = await createAttendance(env, redis as any, employeeId, stampBerlinISO, placeholderEnd);
+    const placeholderEnd = addMinutesISO(stampBerlinISO, 1);
+    const periodId = await createAttendance(env, redis as any, employeeId, stampBerlinISO, placeholderEnd);
 
     const { autoCloseAtUtcMs, autoCloseAtBerlinISO } = computeAutoClose(stampUtc);
 
@@ -154,7 +154,7 @@ export async function handleAttendance(env: Env, redis: RedisLike, body: TimeMot
       startBerlinISO: stampBerlinISO,
       autoCloseAtUtcMs,
       autoCloseAtBerlinISO,
-      personioPeriodId,
+      personioPeriodId: periodId,
       openedEventId: eventId
     };
 
@@ -164,15 +164,12 @@ export async function handleAttendance(env: Env, redis: RedisLike, body: TimeMot
       email,
       start: stampBerlinISO,
       autoCloseAt: autoCloseAtBerlinISO,
-      periodId: personioPeriodId
+      periodId
     });
-
     return;
   }
 
-  // -----------------------
   // OUT
-  // -----------------------
   if (clockingType === "out") {
     const open: OpenSession | null = await getOpenSession(redis as any, email);
     if (!open) {
@@ -180,17 +177,18 @@ export async function handleAttendance(env: Env, redis: RedisLike, body: TimeMot
       await recordAnomaly(redis as any, {
         type: "OUT_WITHOUT_IN",
         email,
-        event_id: eventId,
-        details: JSON.stringify({ out: stampBerlinISO })
+        eventId,
+        details: { out: stampBerlinISO }
       });
       return;
     }
 
-    // Prevent end < start (device time issues)
-    const safeEnd = minIso(stampBerlinISO, addMinutesIso(open.startBerlinISO, 12 * 60));
-    const endFinal = new Date(safeEnd).getTime() < new Date(open.startBerlinISO).getTime()
-      ? addMinutesIso(open.startBerlinISO, 1)
-      : safeEnd;
+    // Safety: end should never be before start; also never exceed start+12h in this guard
+    const cappedEnd = minIso(stampBerlinISO, addMinutesISO(open.startBerlinISO, 12 * 60));
+    const endFinal =
+      new Date(cappedEnd).getTime() < new Date(open.startBerlinISO).getTime()
+        ? addMinutesISO(open.startBerlinISO, 1)
+        : cappedEnd;
 
     await patchAttendanceEnd(env, redis as any, open.personioPeriodId, endFinal);
     await clearOpenSession(redis as any, email);
@@ -201,10 +199,8 @@ export async function handleAttendance(env: Env, redis: RedisLike, body: TimeMot
       end: endFinal,
       periodId: open.personioPeriodId
     });
-
     return;
   }
 
-  // Unknown clocking type
   log("info", "attendance.ignored_clockingType", { email, eventId, clockingType });
 }
