@@ -12,6 +12,18 @@ const redis = createRedis(env);
 
 const app = express();
 
+function getSignatureHeader(req: Request): string | undefined {
+  // try multiple common header names (case-insensitive in Express)
+  return (
+    req.header("timemoto-signature") ??
+    req.header("x-timemoto-signature") ??
+    req.header("x-webhook-signature") ??
+    req.header("x-signature") ??
+    req.header("signature") ??
+    req.header("authorization") // last resort (some systems put signature/token here)
+  );
+}
+
 app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true, ts: new Date().toISOString(), shadow: env.SHADOW_MODE });
 });
@@ -22,10 +34,14 @@ app.post(
   express.raw({ type: "application/json" }),
   async (req: Request, res: Response) => {
     const raw = req.body as Buffer;
-    const sig = req.header("timemoto-signature");
+    const sig = getSignatureHeader(req);
 
     if (!verifyTimemotoSignature(raw, sig, env.TIMEMOTO_WEBHOOK_SECRET)) {
-      log("warn", "webhook.signature_invalid");
+      // DSGVO-minimal: only header NAMES, not values
+      log("warn", "webhook.signature_invalid", {
+        headerKeys: Object.keys(req.headers),
+        hasSig: Boolean(sig)
+      });
       return res.status(401).json({ ok: false, code: "SIGNATURE_INVALID" });
     }
 
@@ -36,6 +52,7 @@ app.post(
       return res.status(400).json({ ok: false, code: "INVALID_JSON" });
     }
 
+    // ignore TimeMoto test event (some providers sign it differently / not at all)
     if (body?.event === "test") return res.json({ ok: true });
 
     try {
