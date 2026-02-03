@@ -1,11 +1,11 @@
 import express from "express";
 import type { Request, Response } from "express";
-import { loadEnv } from "./env";
-import { createRedis } from "./redis";
-import { log } from "./log";
-import { verifyTimemotoSignature } from "./timemoto";
-import { handleAttendance } from "./processor";
-import { listAnomalies } from "./anomalies";
+import { loadEnv } from "./env.js";
+import { createRedis } from "./redis.js";
+import { log } from "./log.js";
+import { verifyTimemotoSignature } from "./timemoto.js";
+import { handleAttendance } from "./processor.js";
+import { listAnomalies } from "./anomalies.js";
 
 const env = loadEnv();
 const redis = createRedis(env);
