@@ -2,7 +2,7 @@ import express, { type Request, type Response } from "express";
 import { loadEnv } from "./env";
 import { createRedis } from "./redis";
 import { log } from "./log";
-import { verifyTimemotoSignature } from "./timemoto";
+import { verifyTimemotoSignature, getClockingType } from "./timemoto";
 import { handleAttendance } from "./processor";
 import { listAnomalies, recordAnomaly } from "./anomalies";
 import { runAutoClose } from "./cron";
@@ -31,53 +31,96 @@ async function main() {
   const webhookPath = env.WEBHOOK_PATH_TOKEN ? `/webhook/${env.WEBHOOK_PATH_TOKEN}` : "/webhook/timemoto";
 
   // IMPORTANT: TimeMoto sends POST
-  app.post(webhookPath, express.raw({ type: "application/json" }), async (req: Request, res: Response) => {
-    const raw = req.body as Buffer;
+  // IMPORTANT: Must use RAW body for signature verification.
+  app.post(
+    webhookPath,
+    express.raw({ type: ["application/json", "application/*+json", "*/*"] }),
+    async (req: Request, res: Response) => {
+      const raw = req.body as Buffer;
 
-    const sig = (req.header("timemoto-signature") ?? "").trim();
-    const okSig = sig && verifyTimemotoSignature(raw, sig, env.TIMEMOTO_WEBHOOK_SECRET);
+      // Signature header: try several common variants
+      const sig =
+        (req.header("timemoto-signature") ??
+          req.header("x-timemoto-signature") ??
+          req.header("x-webhook-signature") ??
+          req.header("x-signature") ??
+          req.header("signature") ??
+          "").trim();
 
-    if (!okSig) {
-      log("warn", "webhook.signature_invalid", {
-        hasSig: !!sig,
-        sigLen: sig.length,
-        sigPrefix: sig.slice(0, 6),
-        bodyLen: raw.length
-      });
+      const okSig = sig && verifyTimemotoSignature(raw, sig, env.TIMEMOTO_WEBHOOK_SECRET);
 
-      await recordAnomaly(redis, {
-        type: "SIGNATURE_INVALID",
-        details: { hasSig: !!sig, sigPrefix: sig.slice(0, 10), bodyLen: raw.length }
-      });
+      if (!okSig) {
+        log("warn", "webhook.signature_invalid", {
+          hasSig: !!sig,
+          sigLen: sig.length,
+          sigPrefix: sig.slice(0, 6),
+          bodyLen: raw?.length ?? 0,
+          contentType: req.header("content-type") ?? "",
+          // helps identify header naming without leaking the full headers
+          sigHeaderKeys: Object.keys(req.headers).filter((h) => h.toLowerCase().includes("signature"))
+        });
 
-      if (!env.ALLOW_INVALID_SIGNATURE) {
-        return res.status(401).json({ ok: false, code: "SIGNATURE_INVALID" });
+        await recordAnomaly(redis, {
+          type: "SIGNATURE_INVALID",
+          details: {
+            hasSig: !!sig,
+            sigPrefix: sig.slice(0, 10),
+            bodyLen: raw?.length ?? 0,
+            sigHeaderKeys: Object.keys(req.headers).filter((h) => h.toLowerCase().includes("signature"))
+          }
+        });
+
+        if (!env.ALLOW_INVALID_SIGNATURE) {
+          return res.status(401).json({ ok: false, code: "SIGNATURE_INVALID" });
+        }
+      }
+
+      let body: any;
+      try {
+        body = JSON.parse(raw.toString("utf8"));
+      } catch {
+        return res.status(400).json({ ok: false, code: "INVALID_JSON" });
+      }
+
+      // TimeMoto "test" event
+      if (body?.event === "test") {
+        log("info", "webhook.test_event_received");
+        return res.json({ ok: true });
+      }
+
+      try {
+        // Robust: Do NOT rely on event name (providers change naming).
+        // If payload contains a valid clockingType, process it.
+        const ct = getClockingType(body);
+
+        if (ct) {
+          await handleAttendance(env, redis, body);
+        } else {
+          log("warn", "webhook.unknown_event_shape", {
+            event: body?.event,
+            keys: Object.keys(body ?? {}),
+            dataKeys: Object.keys(body?.data ?? {}),
+            // help debugging (no secrets)
+            sample: {
+              id: body?.id,
+              clockingType: body?.data?.clockingType,
+              userEmployeeNumber: body?.data?.userEmployeeNumber,
+              emailAddress: body?.data?.emailAddress,
+              timeLogged: body?.data?.timeLogged,
+              timeLoggedRounded: body?.data?.timeLoggedRounded,
+              timeInserted: body?.data?.timeInserted,
+              timeZone: body?.data?.timeZone
+            }
+          });
+        }
+
+        return res.json({ ok: true });
+      } catch (e: any) {
+        log("error", "webhook.processing_error", { err: String(e?.message ?? e) });
+        return res.status(500).json({ ok: false, code: "PROCESSING_ERROR", message: String(e?.message ?? e) });
       }
     }
-
-    let body: any;
-    try {
-      body = JSON.parse(raw.toString("utf8"));
-    } catch {
-      return res.status(400).json({ ok: false, code: "INVALID_JSON" });
-    }
-
-    // TimeMoto "test" event
-    if (body?.event === "test") {
-      log("info", "webhook.test_event_received");
-      return res.json({ ok: true });
-    }
-
-    try {
-      if (typeof body?.event === "string" && body.event.startsWith("attendance.")) {
-        await handleAttendance(env, redis, body);
-      }
-      return res.json({ ok: true });
-    } catch (e: any) {
-      log("error", "webhook.processing_error", { err: String(e?.message ?? e) });
-      return res.status(500).json({ ok: false, code: "PROCESSING_ERROR", message: String(e?.message ?? e) });
-    }
-  });
+  );
 
   // Admin: anomalies
   app.get("/admin/anomalies", async (req: Request, res: Response) => {
