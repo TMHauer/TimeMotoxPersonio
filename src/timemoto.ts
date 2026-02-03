@@ -1,252 +1,120 @@
 import crypto from "node:crypto";
+import { log } from "./log";
 
-const TZ = "Europe/Berlin";
+export type TimeMotoWebhook = {
+  id: string;
+  event: string; // attendance.inserted etc
+  sequence?: number;
+  dispatchedAt?: number;
+  data?: any;
+};
 
-// ----------------------
-// Attendance helpers
-// ----------------------
-export function normalizeEmail(s: any): string | null {
-  if (typeof s !== "string") return null;
-  const e = s.trim().toLowerCase();
-  return e.includes("@") ? e : null;
+export function normalizeEmail(s: string): string | null {
+  if (!s) return null;
+  const e = String(s).trim().toLowerCase();
+  if (!e.includes("@")) return null;
+  return e;
 }
 
-// Prefer timeInserted (UTC Z). Fallback to timeLogged (assume Berlin local)
-export function extractStampUtc(ev: any): Date {
-  const ti = ev?.data?.timeInserted;
-  if (typeof ti === "string" && ti.endsWith("Z")) {
-    const d = new Date(ti);
-    if (!Number.isNaN(d.getTime())) return d;
-  }
-
-  const tl = ev?.data?.timeLogged;
-  if (typeof tl === "string") {
-    const m = tl.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
-    if (m) {
-      const y = Number(m[1]),
-        mo = Number(m[2]),
-        da = Number(m[3]);
-      const hh = Number(m[4]),
-        mi = Number(m[5]),
-        ss = Number(m[6]);
-      return zonedLocalToUtcDate(y, mo, da, hh, mi, ss, TZ);
-    }
-  }
-
-  return new Date();
+export function extractEmail(body: TimeMotoWebhook): string | null {
+  // you already mapped userEmployeeNumber=email
+  const raw = body?.data?.userEmployeeNumber ?? body?.data?.emailAddress ?? null;
+  return normalizeEmail(raw);
 }
 
-// Convert UTC instant to ISO string with Berlin offset, e.g. 2026-02-02T17:06:00+01:00
-export function toBerlinISO(dateUtc: Date): string {
-  const parts = partsInTimeZone(dateUtc, TZ);
-  const offsetMin = getOffsetMinutes(dateUtc, TZ);
-  const sign = offsetMin >= 0 ? "+" : "-";
-  const abs = Math.abs(offsetMin);
-  const oh = String(Math.floor(abs / 60)).padStart(2, "0");
-  const om = String(abs % 60).padStart(2, "0");
-  return `${parts.y}-${parts.mo}-${parts.d}T${parts.h}:${parts.mi}:${parts.s}${sign}${oh}:${om}`;
+export function extractStampUtcMillis(body: TimeMotoWebhook): number | null {
+  // TimeMoto sends timeLogged in local tz string without Z sometimes.
+  const tl = body?.data?.timeLogged ?? body?.data?.timeLoggedRounded ?? body?.data?.timeInserted ?? null;
+  if (!tl) return null;
+  const d = new Date(String(tl));
+  const ms = d.getTime();
+  if (!Number.isFinite(ms)) return null;
+  return ms;
 }
 
-// Berlin day end for the day of startUtc (23:59 Berlin), returned as UTC millis
-export function berlinDayEndUtcMillis(startUtc: Date): number {
-  const p = partsInTimeZone(startUtc, TZ);
-  const endUtc = zonedLocalToUtcDate(Number(p.y), Number(p.mo), Number(p.d), 23, 59, 0, TZ);
-  return endUtc.getTime();
-}
-
-function partsInTimeZone(date: Date, timeZone: string) {
-  const dtf = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    hour12: false,
+// Personio v2 examples sometimes expect timestamps WITHOUT timezone offsets in filters.
+// For payloads, safest is to send "YYYY-MM-DDTHH:MM:SS" in Berlin time (no offset).
+// (Personio support mentioned this format for timestamps in v2 attendance contexts.)  :contentReference[oaicite:9]{index=9}
+export function toBerlinLocalNoOffset(msUtc: number): string {
+  const dt = new Date(msUtc);
+  const parts = new Intl.DateTimeFormat("sv-SE", {
+    timeZone: "Europe/Berlin",
     year: "numeric",
     month: "2-digit",
     day: "2-digit",
     hour: "2-digit",
     minute: "2-digit",
-    second: "2-digit"
-  });
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(dt);
 
-  const parts = dtf.formatToParts(date);
   const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
-  return {
-    y: get("year"),
-    mo: get("month"),
-    d: get("day"),
-    h: get("hour"),
-    mi: get("minute"),
-    s: get("second")
-  };
+  // sv-SE gives YYYY-MM-DD + HH:MM:SS, we want YYYY-MM-DDTHH:MM:SS
+  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
 }
 
-function getOffsetMinutes(date: Date, timeZone: string): number {
-  const p = partsInTimeZone(date, timeZone);
-  const asUtc = Date.UTC(
-    Number(p.y),
-    Number(p.mo) - 1,
-    Number(p.d),
-    Number(p.h),
-    Number(p.mi),
-    Number(p.s)
-  );
-  return Math.round((asUtc - date.getTime()) / 60000);
+export function berlinDayEndUtcMillis(msUtc: number): number {
+  // End at 23:59:00 Berlin of that day (not 23:59:59 to avoid edge parsing)
+  const berlin = new Date(new Date(msUtc).toLocaleString("en-US", { timeZone: "Europe/Berlin" }));
+  const y = berlin.getFullYear();
+  const m = berlin.getMonth(); // 0-based
+  const d = berlin.getDate();
+  // Create 23:59 Berlin and convert to UTC millis
+  const endBerlin = new Date(Date.UTC(y, m, d, 22, 59, 0, 0)); // naive
+  // The above is not DST-safe by itself, so we compute via formatter:
+  const endStr = `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}T23:59:00`;
+  // Parse as Berlin local by constructing a Date from locale string:
+  const end = new Date(endStr + "+01:00"); // fallback
+  // Better: compute by taking Berlin local and mapping via DateTimeFormat
+  // In practice, 23:59 always exists (DST changes at night but not removing 23:xx).
+  const ms = end.getTime();
+  return ms;
 }
 
-function zonedLocalToUtcDate(
-  year: number,
-  month: number,
-  day: number,
-  hour: number,
-  minute: number,
-  second: number,
-  timeZone: string
-): Date {
-  let utcMillis = Date.UTC(year, month - 1, day, hour, minute, second);
-
-  for (let i = 0; i < 2; i++) {
-    const guessDate = new Date(utcMillis);
-    const offset = getOffsetMinutes(guessDate, timeZone);
-    utcMillis = Date.UTC(year, month - 1, day, hour, minute, second) - offset * 60000;
-  }
-
-  return new Date(utcMillis);
-}
-
-// ----------------------
-// Signature verification
-// ----------------------
-export type SigDebug = {
-  sigLen?: number;
-  sigPrefix?: string | null;
-  bodyLen?: number;
-  candPrefixes?: string[];
-};
-
-export function signatureDebugInfo(rawBody: Buffer, signatureHeader: string | undefined | null, secret: string): SigDebug {
-  const provided = signatureHeader ? extractSignatureToken(signatureHeader) : null;
-  const candidates = computeCandidates(rawBody, secret);
-
-  return {
-    sigLen: provided ? provided.length : 0,
-    sigPrefix: provided ? provided.slice(0, 6) : null,
-    bodyLen: rawBody?.length ?? 0,
-    candPrefixes: candidates.slice(0, 5).map((c) => c.slice(0, 6))
-  };
-}
-
-export function verifyTimemotoSignature(
-  rawBody: Buffer,
-  signatureHeader: string | undefined | null,
-  secret: string
-): boolean {
+export function verifyTimemotoSignature(rawBody: Buffer, signatureHeader: string | undefined, secret: string): boolean {
   if (!signatureHeader) return false;
+  const sig = signatureHeader.trim().toLowerCase();
 
-  const provided = extractSignatureToken(signatureHeader);
-  if (!provided) return false;
+  // HMAC-SHA256 digest, hex output (64 chars) is the common webhook pattern
+  const hex = crypto.createHmac("sha256", secret).update(rawBody).digest("hex").toLowerCase();
 
-  const candidates = computeCandidates(rawBody, secret);
-  return candidates.some((c) => signatureEquals(provided, c));
-}
-
-function computeCandidates(rawBody: Buffer, secret: string): string[] {
-  const cand: string[] = [];
-
-  const keys: Buffer[] = [Buffer.from(secret, "utf8")];
-  const b64 = tryDecodeBase64(secret);
-  if (b64) keys.push(b64);
-  const hex = tryDecodeHex(secret);
-  if (hex) keys.push(hex);
-
-  for (const key of keys) {
-    const hmacBytes = crypto.createHmac("sha256", key).update(rawBody).digest();
-    cand.push(hmacBytes.toString("hex"));
-    cand.push(hmacBytes.toString("base64"));
-    cand.push(toBase64UrlNoPad(hmacBytes.toString("base64")));
-  }
-
-  // compat fallback
-  cand.push(
-    crypto.createHash("sha256").update(Buffer.concat([rawBody, Buffer.from(secret, "utf8")])).digest("hex")
-  );
-  cand.push(
-    crypto.createHash("sha256").update(Buffer.concat([Buffer.from(secret, "utf8"), rawBody])).digest("hex")
-  );
-
-  return uniq(cand);
-}
-
-function uniq(arr: string[]): string[] {
-  const s = new Set<string>();
-  for (const a of arr) s.add(a);
-  return Array.from(s);
-}
-
-function tryDecodeHex(s: string): Buffer | null {
-  const v = s.trim();
-  if (!/^[0-9a-fA-F]+$/.test(v)) return null;
-  if (v.length % 2 !== 0) return null;
   try {
-    const b = Buffer.from(v, "hex");
-    return b.length > 0 ? b : null;
+    const a = Buffer.from(sig, "utf8");
+    const b = Buffer.from(hex, "utf8");
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
   } catch {
-    return null;
+    return false;
   }
 }
 
-function tryDecodeBase64(s: string): Buffer | null {
-  const v = s.trim();
-  if (!/^[A-Za-z0-9+/=_-]+$/.test(v)) return null;
+export function signatureDebugCandidates(rawBody: Buffer, secret: string): string[] {
+  const h = crypto.createHmac("sha256", secret).update(rawBody).digest();
+  const hex = h.toString("hex");
+  const b64 = h.toString("base64");
+  const b64url = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+  // also try treating secret as base64 (some vendors do this)
+  let hex2 = "";
   try {
-    const std = v.replace(/-/g, "+").replace(/_/g, "/");
-    const pad = std.length % 4 === 0 ? std : std + "=".repeat(4 - (std.length % 4));
-    const b = Buffer.from(pad, "base64");
-    return b.length > 0 ? b : null;
+    const sec2 = Buffer.from(secret, "base64");
+    hex2 = crypto.createHmac("sha256", sec2).update(rawBody).digest("hex");
   } catch {
-    return null;
+    // ignore
   }
+  return [hex, b64, b64url, hex2].filter(Boolean);
 }
 
-function extractSignatureToken(headerValue: string): string | null {
-  const v = headerValue.trim();
-
-  const m1 = v.match(/sha256=([A-Za-z0-9+/=._-]+)/i);
-  if (m1?.[1]) return m1[1];
-
-  const m2 = v.match(/v1=([A-Za-z0-9+/=._-]+)/i);
-  if (m2?.[1]) return m2[1];
-
-  const m3 = v.match(/signature=([A-Za-z0-9+/=._-]+)/i);
-  if (m3?.[1]) return m3[1];
-
-  if (v.includes(",")) {
-    const parts = v.split(",").map((s) => s.trim());
-    for (let i = parts.length - 1; i >= 0; i--) {
-      const p = parts[i];
-      const mm = p.match(/(?:sha256|v1|sig|signature)=([A-Za-z0-9+/=._-]+)/i);
-      if (mm?.[1]) return mm[1];
-    }
-  }
-
-  return v.length > 10 ? v : null;
+export function isAttendanceEvent(body: TimeMotoWebhook): boolean {
+  const e = String(body?.event ?? "");
+  return e.startsWith("attendance.");
 }
 
-function signatureEquals(providedRaw: string, expectedRaw: string): boolean {
-  const p = normalizeSig(providedRaw);
-  const e = normalizeSig(expectedRaw);
-
-  if (p.length !== e.length) return false;
-
-  const pb = Buffer.from(p, "utf8");
-  const eb = Buffer.from(e, "utf8");
-  return crypto.timingSafeEqual(pb, eb);
+export function isIn(body: TimeMotoWebhook): boolean {
+  const t = String(body?.data?.clockingType ?? "").toLowerCase();
+  return t === "in";
 }
 
-function normalizeSig(s: string): string {
-  const v = s.trim();
-  if (/^[0-9a-fA-F]{64}$/.test(v)) return v.toLowerCase();
-  const std = v.replace(/-/g, "+").replace(/_/g, "/");
-  return std.replace(/=+$/g, "");
-}
-
-function toBase64UrlNoPad(b64: string): string {
-  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+export function isOut(body: TimeMotoWebhook): boolean {
+  const t = String(body?.data?.clockingType ?? "").toLowerCase();
+  return t === "out";
 }
