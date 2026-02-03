@@ -1,6 +1,7 @@
 import type { Env } from "./env";
 import type { Redis } from "./redis";
 import { log } from "./log";
+import { DateTime } from "luxon";
 
 function formEncode(obj: Record<string, string>): string {
   return Object.entries(obj)
@@ -11,6 +12,24 @@ function formEncode(obj: Record<string, string>): string {
 async function personioFetch(env: Env, path: string, init: RequestInit): Promise<Response> {
   const url = `${env.PERSONIO_BASE_URL}${path}`;
   return fetch(url, init);
+}
+
+/**
+ * Personio v2 expects LocalDateTime (no timezone offset).
+ * Convert any ISO (with/without offset) into Europe/Berlin local datetime string: YYYY-MM-DDTHH:mm:ss
+ */
+function toPersonioLocalDateTime(input: string): string {
+  const raw = String(input ?? "").trim();
+  if (!raw) return raw;
+
+  // Try parsing ISO (with or without offset)
+  const dt = DateTime.fromISO(raw, { setZone: true });
+  if (dt.isValid) {
+    return dt.setZone("Europe/Berlin").toFormat("yyyy-MM-dd'T'HH:mm:ss");
+  }
+
+  // Fallback: strip trailing timezone offset/Z if present
+  return raw.replace(/([+-]\d{2}:\d{2}|Z)$/i, "");
 }
 
 export async function getPersonioToken(env: Env, redis: Redis): Promise<string> {
@@ -26,14 +45,13 @@ export async function getPersonioToken(env: Env, redis: Redis): Promise<string> 
     if (Number.isFinite(exp) && exp - now > 60_000) return tok; // 60s buffer
   }
 
-  // Use x-www-form-urlencoded
   const body = formEncode({
     client_id: env.PERSONIO_CLIENT_ID,
     client_secret: env.PERSONIO_CLIENT_SECRET,
     grant_type: "client_credentials"
   });
 
-  // IMPORTANT: For Personio v2, DO NOT set Accept: application/json (your logs show it can be rejected).
+  // IMPORTANT: no Accept: application/json (your logs showed Personio can reject it)
   const r = await personioFetch(env, "/v2/auth/token", {
     method: "POST",
     headers: {
@@ -69,7 +87,7 @@ export async function getEmployeeIdByEmail(env: Env, redis: Redis, email: string
 
   const token = await getPersonioToken(env, redis);
 
-  // v1 employee lookup is OK with accept: application/json
+  // v1 employee lookup is fine with accept: application/json
   const url = `${env.PERSONIO_BASE_URL}/v1/company/employees?limit=1&offset=0&email=${encodeURIComponent(email)}`;
   const r = await fetch(url, {
     method: "GET",
@@ -110,7 +128,6 @@ export async function createAttendanceOpenEnded(
   const token = await getPersonioToken(env, redis);
 
   const headers: Record<string, string> = {
-    // IMPORTANT: no Accept header here (Personio v2 can reject application/json)
     "content-type": "application/json",
     "authorization": `Bearer ${token}`
   };
@@ -119,7 +136,7 @@ export async function createAttendanceOpenEnded(
   const payload = {
     person: { id: employeeId },
     type: "WORK",
-    start: { date_time: startLocalBerlin },
+    start: { date_time: toPersonioLocalDateTime(startLocalBerlin) },
     comment: "TimeMoto"
   };
 
@@ -143,14 +160,13 @@ export async function patchAttendanceEnd(env: Env, redis: Redis, periodId: strin
   const token = await getPersonioToken(env, redis);
 
   const headers: Record<string, string> = {
-    // IMPORTANT: no Accept header here (Personio v2 can reject application/json)
     "content-type": "application/json",
     "authorization": `Bearer ${token}`
   };
   if (env.PERSONIO_BETA_HEADER) headers["Beta"] = "true";
 
   const payload = {
-    end: { date_time: endLocalBerlin }
+    end: { date_time: toPersonioLocalDateTime(endLocalBerlin) }
   };
 
   const qs = env.PERSONIO_SKIP_APPROVAL ? "?skip_approval=true" : "";
@@ -161,6 +177,5 @@ export async function patchAttendanceEnd(env: Env, redis: Redis, periodId: strin
   });
 
   const txt = await r.text();
-  // PATCH may return 204 with empty body (OK)
   if (!r.ok) throw new Error(`Personio patch end failed ${r.status}: ${txt}`);
 }
