@@ -1,11 +1,11 @@
 import express from "express";
 import type { Request, Response } from "express";
-import { loadEnv } from "./env.js";
-import { createRedis } from "./redis.js";
-import { log } from "./log.js";
-import { verifyTimemotoSignature } from "./timemoto.js";
-import { handleAttendance } from "./processor.js";
-import { listAnomalies } from "./anomalies.js";
+import { loadEnv } from "./env";
+import { createRedis } from "./redis";
+import { log } from "./log";
+import { verifyTimemotoSignature } from "./timemoto";
+import { handleAttendance } from "./processor";
+import { listAnomalies } from "./anomalies";
 
 const env = loadEnv();
 const redis = createRedis(env);
@@ -36,25 +36,24 @@ app.post(
       return res.status(400).json({ ok: false, code: "INVALID_JSON" });
     }
 
-    // ignore TimeMoto test event
     if (body?.event === "test") return res.json({ ok: true });
 
     try {
       if (typeof body?.event === "string" && body.event.startsWith("attendance.")) {
         await handleAttendance(env, redis as any, body);
       }
-      // user.* events optional
       return res.json({ ok: true });
     } catch (e: any) {
       log("error", "webhook.processing_error", { err: String(e?.message ?? e) });
-      return res
-        .status(500)
-        .json({ ok: false, code: "PROCESSING_ERROR", message: String(e?.message ?? e) });
+      return res.status(500).json({
+        ok: false,
+        code: "PROCESSING_ERROR",
+        message: String(e?.message ?? e)
+      });
     }
   }
 );
 
-// Admin endpoint: anomalies
 app.get("/admin/anomalies", async (req: Request, res: Response) => {
   const token = (req.header("authorization") ?? "").replace(/^Bearer\s+/i, "");
   if (token !== env.ADMIN_TOKEN) return res.status(401).json({ ok: false });
