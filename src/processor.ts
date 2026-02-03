@@ -19,6 +19,13 @@ async function markEventOnce(redis: Redis, eventId: string): Promise<boolean> {
   return res === "OK";
 }
 
+async function markPunchOnce(redis: Redis, email: string, clockingType: "In" | "Out", stampUtc: number): Promise<boolean> {
+  // Dedup across re-deliveries where eventId changes but punch is same
+  const key = `punch:${email}:${clockingType}:${stampUtc}`;
+  const res = await redis.set(key, "1", { NX: true, EX: 7 * 24 * 3600 });
+  return res === "OK";
+}
+
 function clampAutoClose(utcStart: number): number {
   const twelveH = utcStart + 12 * 3600 * 1000;
   const dayEnd = berlinDayEndUtcMillis(utcStart);
@@ -32,9 +39,10 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
     return;
   }
 
-  const first = await markEventOnce(redis, eventId);
-  if (!first) {
-    log("info", "attendance.duplicate", { eventId });
+  // Event-id dedup (cheap early exit)
+  const firstById = await markEventOnce(redis, eventId);
+  if (!firstById) {
+    log("info", "attendance.duplicate_event_id", { eventId });
     return;
   }
 
@@ -53,6 +61,13 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
   const stampUtc = extractStampUtcMillis(body);
   if (!stampUtc) {
     await recordAnomaly(redis, { type: "STAMP_TIME_MISSING", email, eventId });
+    return;
+  }
+
+  // Punch dedup (handles re-deliveries where eventId differs)
+  const firstPunch = await markPunchOnce(redis, email, clockingType, stampUtc);
+  if (!firstPunch) {
+    log("info", "attendance.duplicate_punch", { email, clockingType, stampUtc, eventId });
     return;
   }
 
