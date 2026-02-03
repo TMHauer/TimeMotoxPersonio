@@ -1,371 +1,146 @@
-import type { Env } from "./env.js";
-import { log } from "./log.js";
-import { pushAnomaly } from "./anomalies.js";
-import { normalizeEmail, extractStampUtc, toBerlinISO, berlinDayEndUtcMillis } from "./timemoto.js";
-import { getEmployeeIdByEmail, createAttendance, patchAttendanceEnd } from "./personio.js";
+import type { Env } from "./env";
+import type { RedisClient } from "./redis";
+import { log } from "./log";
+import type { TimeMotoWebhook } from "./timemoto";
+import { extractEmail, extractStampUtcMillis, isIn, isOut, toBerlinLocalNoOffset } from "./timemoto";
+import { recordAnomaly } from "./anomalies";
+import { createAttendance, getEmployeeIdByEmail, patchAttendanceEnd } from "./personio";
+import { clearOpen, computeAutoClose, getOpen, getRecentHistory, pushHistory, setOpen } from "./session";
 
-type RedisLike = {
-  get(key: string): Promise<any>;
-  set(key: string, value: any, opts?: any): Promise<any>;
-  del(key: string): Promise<any>;
-  zadd(key: string, ...args: any[]): Promise<any>;
-  zrem(key: string, member: string): Promise<any>;
-};
+const IDEMP_PREFIX = "idemp:";
 
-type TMEvent = {
-  id: string;
-  event: string;
-  dispatchedAt?: number;
-  data?: any;
-};
-
-type OpenSession = {
-  email: string;
-  employeeId: string;
-  startUtcMs: number;
-  startBerlinISO: string;
-  autoCloseAtUtcMs: number;
-  autoCloseAtBerlinISO: string;
-  personioPeriodId: string;
-  openedEventId: string;
-  openedAtIso: string;
-};
-
-type LastSession = {
-  email: string;
-  employeeId: string;
-  startUtcMs: number;
-  endUtcMs: number;
-  startBerlinISO: string;
-  endBerlinISO: string;
-  personioPeriodId: string;
-  endReason: "OUT" | "AUTO_CLOSE" | "DOUBLE_IN_CLOSE";
-  closedEventId?: string | null;
-  closedAtIso: string;
-};
-
-const KEY_EVENT = (id: string) => `event:seen:${id}`;
-const KEY_OPEN = (email: string) => `session:open:${email}`;
-const KEY_LAST = (email: string) => `session:last:${email}`;
-const ZSET_AUTOCLOSE = `session:autoclose`; // score=utcMs, member=email
-
-function nowIso() {
-  return new Date().toISOString();
+async function markIdempotent(redis: RedisClient, eventId: string): Promise<boolean> {
+  const key = IDEMP_PREFIX + eventId;
+  // set if not exists, ttl 14d
+  const ok = await redis.set(key, "1", "NX", "PX", 14 * 24 * 3600_000);
+  return ok === "OK";
 }
 
-function addMs(d: Date, ms: number) {
-  return new Date(d.getTime() + ms);
-}
-
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n));
-}
-
-function autoCloseUtcMs(startUtc: Date): number {
-  const t12h = startUtc.getTime() + 12 * 60 * 60 * 1000;
-  const dayEnd = berlinDayEndUtcMillis(startUtc);
-  // Endzeit = min(ClockIn + 12h, Tagesgrenze 23:59 Europe/Berlin)
-  return Math.min(t12h, dayEnd);
-}
-
-function getEmailFromEvent(ev: TMEvent): string | null {
-  // Best: employeeNumber contains email (you’re filling it)
-  const e1 = normalizeEmail(ev?.data?.userEmployeeNumber);
-  if (e1) return e1;
-
-  // Some user events include emailAddress
-  const e2 = normalizeEmail(ev?.data?.emailAddress);
-  if (e2) return e2;
-
-  return null;
-}
-
-async function markEventSeen(redis: RedisLike, id: string): Promise<boolean> {
-  // Upstash supports NX
-  const r = await redis.set(KEY_EVENT(id), "1", { nx: true, ex: 60 * 60 * 24 * 30 });
-  // If already exists -> r is null/undefined/false depending on client
-  return r === "OK" || r === true;
-}
-
-async function loadOpen(redis: RedisLike, email: string): Promise<OpenSession | null> {
-  const raw = await redis.get(KEY_OPEN(email));
-  if (!raw) return null;
-  try {
-    return typeof raw === "string" ? (JSON.parse(raw) as OpenSession) : (raw as OpenSession);
-  } catch {
-    return null;
-  }
-}
-
-async function saveOpen(redis: RedisLike, s: OpenSession): Promise<void> {
-  await redis.set(KEY_OPEN(s.email), JSON.stringify(s));
-  await redis.zadd(ZSET_AUTOCLOSE, { score: s.autoCloseAtUtcMs, member: s.email });
-}
-
-async function clearOpen(redis: RedisLike, email: string): Promise<void> {
-  await redis.del(KEY_OPEN(email));
-  await redis.zrem(ZSET_AUTOCLOSE, email);
-}
-
-async function saveLast(redis: RedisLike, last: LastSession): Promise<void> {
-  await redis.set(KEY_LAST(last.email), JSON.stringify(last), { ex: 60 * 60 * 24 * 7 }); // keep 7d
-}
-
-async function loadLast(redis: RedisLike, email: string): Promise<LastSession | null> {
-  const raw = await redis.get(KEY_LAST(email));
-  if (!raw) return null;
-  try {
-    return typeof raw === "string" ? (JSON.parse(raw) as LastSession) : (raw as LastSession);
-  } catch {
-    return null;
-  }
-}
-
-async function anomaly(redis: RedisLike, type: string, email: string | null, eventId: string | null, details: any) {
-  await pushAnomaly(redis as any, {
-    type,
-    email,
-    eventId,
-    details
-  });
-}
-
-export async function handleAttendance(env: Env, redis: RedisLike, ev: TMEvent): Promise<void> {
-  const eventId = String(ev?.id ?? "");
-  const eventName = String(ev?.event ?? "");
-
-  if (!eventId || !eventName) return;
-
-  // Idempotency (webhooks can repeat)
-  const firstTime = await markEventSeen(redis, eventId);
-  if (!firstTime) {
-    log("info", "attendance.duplicate", { eventId, event: eventName, email: getEmailFromEvent(ev) ?? null });
+export async function handleAttendance(env: Env, redis: RedisClient, body: TimeMotoWebhook) {
+  const eventId = String(body?.id ?? "");
+  if (!eventId) {
+    await recordAnomaly(redis, { ts: new Date().toISOString(), type: "EVENT_ID_MISSING", details: { event: body?.event } });
     return;
   }
 
-  if (eventName !== "attendance.inserted" && !eventName.startsWith("attendance.")) {
-    log("info", "attendance.ignored_event", { eventId, event: eventName });
+  const first = await markIdempotent(redis, eventId);
+  if (!first) {
+    log("info", "attendance.duplicate", { eventId });
     return;
   }
 
-  const clockingType = String(ev?.data?.clockingType ?? "").toLowerCase(); // "In"/"Out"
-  const email = getEmailFromEvent(ev);
-
+  const email = extractEmail(body);
   if (!email) {
-    log("warn", "attendance.email_missing", { eventId, event: eventName });
-    await anomaly(redis, "EMAIL_MISSING", null, eventId, { have: Object.keys(ev?.data ?? {}) });
+    await recordAnomaly(redis, { ts: new Date().toISOString(), type: "EMAIL_MISSING", eventId, details: { userEmployeeNumber: body?.data?.userEmployeeNumber } });
     return;
   }
 
-  const stampUtc = extractStampUtc(ev);
-  const stampBerlinISO = toBerlinISO(stampUtc);
-
-  if (clockingType === "in") {
-    await handleIn(env, redis, ev, email, stampUtc, stampBerlinISO);
+  const stampUtc = extractStampUtcMillis(body);
+  if (!stampUtc) {
+    await recordAnomaly(redis, { ts: new Date().toISOString(), type: "STAMP_MISSING", email, eventId });
     return;
   }
 
-  if (clockingType === "out") {
-    await handleOut(env, redis, ev, email, stampUtc, stampBerlinISO);
-    return;
-  }
+  const stampBerlin = toBerlinLocalNoOffset(stampUtc);
 
-  log("info", "attendance.ignored_clocking_type", { eventId, email, clockingType });
-}
+  if (isIn(body)) {
+    const prev = await getOpen(redis, email);
+    if (prev) {
+      // DOUBLE-IN: close previous at min(prevStart+60min? no, close at newIn if possible but >= prevStart+60s)
+      const minEndUtc = prev.startUtc + 60_000;
+      const closeUtc = Math.max(minEndUtc, stampUtc);
+      const closeBerlin = toBerlinLocalNoOffset(closeUtc);
 
-async function handleIn(
-  env: Env,
-  redis: RedisLike,
-  ev: TMEvent,
-  email: string,
-  inUtc: Date,
-  inBerlinISO: string
-) {
-  const eventId = String(ev.id);
-  const open = await loadOpen(redis, email);
+      await recordAnomaly(redis, {
+        ts: new Date().toISOString(),
+        type: "DOUBLE_IN",
+        email,
+        eventId,
+        details: { prevStart: prev.startBerlin, closeAt: closeBerlin }
+      });
 
-  // Resolve Personio personId once per IN (cached inside personio.ts)
-  let employeeId: string;
-  try {
-    employeeId = await getEmployeeIdByEmail(env, redis as any, email);
-  } catch (e: any) {
-    log("warn", "personio.person_not_found", { email, err: String(e?.message ?? e) });
-    await anomaly(redis, "PERSONIO_NOT_FOUND", email, eventId, { err: String(e?.message ?? e) });
-    return;
-  }
-
-  // DOUBLE-IN: close previous session at (new IN - 1 minute), then open a new one
-  if (open) {
-    const prevEndUtc = addMs(inUtc, -60_000);
-    const prevEndUtcMs = Math.max(open.startUtcMs + 60_000, prevEndUtc.getTime());
-    const prevEndBerlin = toBerlinISO(new Date(prevEndUtcMs));
-
-    log("warn", "attendance.double_in", { email, prevStart: open.startBerlinISO, closeAt: prevEndBerlin });
-
-    if (!env.SHADOW_MODE) {
-      try {
-        await patchAttendanceEnd(env, redis as any, open.personioPeriodId, prevEndBerlin);
-      } catch (e: any) {
-        log("error", "personio.patch_end_failed", { email, periodId: open.personioPeriodId, err: String(e?.message ?? e) });
-        await anomaly(redis, "PERSONIO_PATCH_FAILED", email, eventId, { periodId: open.personioPeriodId, err: String(e?.message ?? e) });
-        // We still continue to open new session to keep operational flow
-      }
+      // patch previous
+      await patchAttendanceEnd(env, redis, prev.periodId, closeBerlin);
+      await pushHistory(redis, email, {
+        start: prev.startBerlin,
+        end: closeBerlin,
+        end_reason: "DOUBLE_IN_CLOSE",
+        periodId: prev.periodId,
+        openedEventId: prev.openedEventId,
+        closedEventId: eventId,
+        ts: new Date().toISOString()
+      });
+      await clearOpen(redis, email);
     }
 
-    await saveLast(redis, {
+    const employeeId = await getEmployeeIdByEmail(env, redis, email);
+    if (!employeeId) {
+      await recordAnomaly(redis, { ts: new Date().toISOString(), type: "PERSONIO_NOT_FOUND", email, eventId });
+      return;
+    }
+
+    // Create attendance immediately with placeholder end (+60s) then patch end later on OUT/autoclose.
+    const placeholderEndBerlin = toBerlinLocalNoOffset(stampUtc + 60_000);
+    const periodId = await createAttendance(env, redis, employeeId, stampBerlin, placeholderEndBerlin);
+
+    const { autoCloseAtUtc, autoCloseAtBerlin } = computeAutoClose(stampUtc);
+    await setOpen(redis, {
       email,
-      employeeId: open.employeeId,
-      startUtcMs: open.startUtcMs,
-      endUtcMs: prevEndUtcMs,
-      startBerlinISO: open.startBerlinISO,
-      endBerlinISO: prevEndBerlin,
-      personioPeriodId: open.personioPeriodId,
-      endReason: "DOUBLE_IN_CLOSE",
-      closedEventId: eventId,
-      closedAtIso: nowIso()
+      startUtc: stampUtc,
+      startBerlin,
+      autoCloseAtUtc,
+      autoCloseAtBerlin,
+      periodId,
+      openedEventId: eventId
     });
 
-    await clearOpen(redis, email);
-  }
-
-  // Create provisional attendance period on IN:
-  // Personio needs start+end. We set end = start + 1 minute and patch later on OUT/autoclose.
-  const provisionalEndUtc = addMs(inUtc, 60_000);
-  const provisionalEndBerlin = toBerlinISO(provisionalEndUtc);
-
-  let periodId = "shadow-period";
-  if (!env.SHADOW_MODE) {
-    periodId = await createAttendance(env, redis as any, employeeId, inBerlinISO, provisionalEndBerlin);
-  } else {
-    log("info", "personio.shadow_skip_create", { email, start: inBerlinISO, end: provisionalEndBerlin });
-  }
-
-  const acUtcMs = autoCloseUtcMs(inUtc);
-  const acBerlinISO = toBerlinISO(new Date(acUtcMs));
-
-  const sess: OpenSession = {
-    email,
-    employeeId,
-    startUtcMs: inUtc.getTime(),
-    startBerlinISO: inBerlinISO,
-    autoCloseAtUtcMs: acUtcMs,
-    autoCloseAtBerlinISO: acBerlinISO,
-    personioPeriodId: periodId,
-    openedEventId: eventId,
-    openedAtIso: nowIso()
-  };
-
-  await saveOpen(redis, sess);
-
-  log("info", "attendance.in.opened", {
-    email,
-    start: inBerlinISO,
-    autoCloseAt: acBerlinISO,
-    periodId
-  });
-}
-
-async function handleOut(
-  env: Env,
-  redis: RedisLike,
-  ev: TMEvent,
-  email: string,
-  outUtc: Date,
-  outBerlinISO: string
-) {
-  const eventId = String(ev.id);
-  const open = await loadOpen(redis, email);
-
-  // OUT without IN -> try late OUT after AUTO_CLOSE
-  if (!open) {
-    const last = await loadLast(redis, email);
-
-    if (last && last.endReason === "AUTO_CLOSE") {
-      // If OUT arrives later but should replace auto-closed end
-      const maxEnd = last.startUtcMs + 12 * 60 * 60 * 1000;
-      const outMs = outUtc.getTime();
-
-      if (outMs > last.endUtcMs && outMs <= maxEnd) {
-        // Patch end to real OUT
-        const endBerlin = outBerlinISO;
-        log("info", "attendance.out.updating_autoclosed", {
-          email,
-          periodId: last.personioPeriodId,
-          oldEnd: last.endBerlinISO,
-          newEnd: endBerlin
-        });
-
-        if (!env.SHADOW_MODE) {
-          try {
-            await patchAttendanceEnd(env, redis as any, last.personioPeriodId, endBerlin);
-          } catch (e: any) {
-            log("error", "personio.patch_end_failed", {
-              email,
-              periodId: last.personioPeriodId,
-              err: String(e?.message ?? e)
-            });
-            await anomaly(redis, "PERSONIO_PATCH_FAILED", email, eventId, {
-              periodId: last.personioPeriodId,
-              err: String(e?.message ?? e)
-            });
-            return;
-          }
-        }
-
-        await saveLast(redis, {
-          ...last,
-          endUtcMs: outMs,
-          endBerlinISO: endBerlin,
-          endReason: "OUT",
-          closedEventId: eventId,
-          closedAtIso: nowIso()
-        });
-
-        return;
-      }
-    }
-
-    log("warn", "attendance.out.without_in", { email, out: outBerlinISO });
-    await anomaly(redis, "OUT_WITHOUT_IN", email, eventId, { out: outBerlinISO });
+    log("info", "attendance.in.opened", { email, start: stampBerlin, autoCloseAt: autoCloseAtBerlin, periodId });
     return;
   }
 
-  // Normal OUT closes open session
-  const startMs = open.startUtcMs;
-  const outMsRaw = outUtc.getTime();
+  if (isOut(body)) {
+    const open = await getOpen(redis, email);
+    if (!open) {
+      // late OUT after autoclose? try fix last history if it was AUTO_CLOSE today
+      const recent = await getRecentHistory(redis, email, 10);
+      const candidate = recent.find((h: any) => h?.end_reason === "AUTO_CLOSE");
+      if (candidate && candidate?.periodId && typeof candidate?.start === "string" && typeof candidate?.end === "string") {
+        // if OUT within 12h window and after end -> patch
+        await patchAttendanceEnd(env, redis, String(candidate.periodId), stampBerlin);
+        await pushHistory(redis, email, {
+          start: candidate.start,
+          end: stampBerlin,
+          end_reason: "OUT_LATE_AFTER_AUTOCLOSE",
+          periodId: candidate.periodId,
+          closedEventId: eventId,
+          ts: new Date().toISOString()
+        });
+        log("info", "attendance.out.late_patched", { email, periodId: candidate.periodId, end: stampBerlin });
+        return;
+      }
 
-  // If OUT timestamp earlier than IN -> clamp to at least start + 1 min
-  const outMs = Math.max(outMsRaw, startMs + 60_000);
+      await recordAnomaly(redis, { ts: new Date().toISOString(), type: "OUT_WITHOUT_IN", email, eventId, details: { out: stampBerlin } });
+      log("warn", "attendance.out.without_in", { email, out: stampBerlin });
+      return;
+    }
 
-  // If it exceeds auto-close limit, clamp to auto-close (safety)
-  const clampedMs = clamp(outMs, startMs + 60_000, open.autoCloseAtUtcMs);
-  const endBerlin = toBerlinISO(new Date(clampedMs));
+    // normal close
+    await patchAttendanceEnd(env, redis, open.periodId, stampBerlin);
+    await pushHistory(redis, email, {
+      start: open.startBerlin,
+      end: stampBerlin,
+      end_reason: "OUT",
+      periodId: open.periodId,
+      openedEventId: open.openedEventId,
+      closedEventId: eventId,
+      ts: new Date().toISOString()
+    });
+    await clearOpen(redis, email);
 
-  if (!env.SHADOW_MODE) {
-    await patchAttendanceEnd(env, redis as any, open.personioPeriodId, endBerlin);
-  } else {
-    log("info", "personio.shadow_skip_patch_end", { email, periodId: open.personioPeriodId, end: endBerlin });
+    log("info", "attendance.out.closed", { email, start: open.startBerlin, end: stampBerlin, periodId: open.periodId });
+    return;
   }
 
-  await saveLast(redis, {
-    email,
-    employeeId: open.employeeId,
-    startUtcMs: open.startUtcMs,
-    endUtcMs: clampedMs,
-    startBerlinISO: open.startBerlinISO,
-    endBerlinISO: endBerlin,
-    personioPeriodId: open.personioPeriodId,
-    endReason: "OUT",
-    closedEventId: eventId,
-    closedAtIso: nowIso()
-  });
-
-  await clearOpen(redis, email);
-
-  log("info", "attendance.out.closed", {
-    email,
-    start: open.startBerlinISO,
-    end: endBerlin,
-    periodId: open.personioPeriodId
-  });
+  // ignore other attendance.* types safely
+  log("info", "attendance.ignored", { eventId, email, event: body?.event });
 }
