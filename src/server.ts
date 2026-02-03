@@ -1,4 +1,5 @@
 import express from "express";
+import type { Request, Response } from "express";
 import { loadEnv } from "./env.js";
 import { createRedis } from "./redis.js";
 import { log } from "./log.js";
