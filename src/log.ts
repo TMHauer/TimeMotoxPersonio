@@ -1,12 +1,12 @@
 export type LogLevel = "info" | "warn" | "error";
 
-export function log(level: LogLevel, event: string, data: Record<string, any> = {}) {
-  const line = {
+export function log(level: LogLevel, event: string, extra?: Record<string, unknown>) {
+  const payload = {
     ts: new Date().toISOString(),
     level,
     event,
-    ...data
+    ...(extra ?? {})
   };
-  // Render picks up stdout
-  console.log(JSON.stringify(line));
+  // minimal PII: email only if necessary in extra
+  console.log(JSON.stringify(payload));
 }
