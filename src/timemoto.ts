@@ -62,9 +62,31 @@ function base64ToBuf(s: string): Buffer | null {
   }
 }
 
+function signatureCandidates(headerSig: string): string[] {
+  const trimmed = (headerSig ?? "").trim();
+  if (!trimmed) return [];
+
+  const out = new Set<string>();
+  out.add(trimmed);
+
+  const normalized = trimmed.replace(/^sha256=/i, "").replace(/^hmac-sha256=/i, "");
+  out.add(normalized);
+
+  for (const token of trimmed.split(/,\s*/)) {
+    if (!token) continue;
+    out.add(token);
+    const idx = token.indexOf("=");
+    if (idx !== -1 && idx + 1 < token.length) {
+      out.add(token.slice(idx + 1));
+    }
+  }
+
+  return [...out].map((v) => v.trim()).filter(Boolean);
+}
+
 export function verifyTimemotoSignature(rawBody: Buffer, headerSig: string, secret: string): boolean {
-  const sig = (headerSig ?? "").trim();
-  if (!sig) return false;
+  const sigs = signatureCandidates(headerSig);
+  if (sigs.length === 0) return false;
 
   const candidates: Buffer[] = [];
 
@@ -89,14 +111,20 @@ export function verifyTimemotoSignature(rawBody: Buffer, headerSig: string, secr
   // compare against hex signature (most common: 64 hex chars)
   for (const key of candidates) {
     const h = crypto.createHmac("sha256", key).update(rawBody).digest("hex");
-    if (timingSafeEq(h.toLowerCase(), sig.toLowerCase())) return true;
+    for (const sig of sigs) {
+      if (timingSafeEq(h.toLowerCase(), sig.toLowerCase())) return true;
+    }
 
     // sometimes sent as base64
     const b64 = crypto.createHmac("sha256", key).update(rawBody).digest("base64");
-    if (timingSafeEq(b64, sig)) return true;
+    for (const sig of sigs) {
+      if (timingSafeEq(b64, sig)) return true;
+    }
 
     const b64url = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-    if (timingSafeEq(b64url, sig)) return true;
+    for (const sig of sigs) {
+      if (timingSafeEq(b64url, sig)) return true;
+    }
   }
 
   return false;
