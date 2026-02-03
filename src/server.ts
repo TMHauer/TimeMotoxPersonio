@@ -28,8 +28,10 @@ async function main() {
     }
   });
 
+  const webhookPath = env.WEBHOOK_PATH_TOKEN ? `/webhook/${env.WEBHOOK_PATH_TOKEN}` : "/webhook/timemoto";
+
   // IMPORTANT: TimeMoto sends POST
-  app.post("/webhook/timemoto", express.raw({ type: "application/json" }), async (req: Request, res: Response) => {
+  app.post(webhookPath, express.raw({ type: "application/json" }), async (req: Request, res: Response) => {
     const raw = req.body as Buffer;
 
     const sig = (req.header("timemoto-signature") ?? "").trim();
