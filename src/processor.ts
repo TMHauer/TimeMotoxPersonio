@@ -1,17 +1,16 @@
-import type { Env } from "./env.js";
+import type { Env } from "./env";
 import type { Redis } from "@upstash/redis";
-import { log } from "./log.js";
-import { pushAnomaly } from "./anomalies.js";
-import { normalizeEmail, extractStampUtc, utcToBerlinLocalIso, berlinDayEnd } from "./timemoto.js";
-import { getEmployeeIdByEmail, createAttendance, patchAttendanceEnd } from "./personio.js";
-import { getOpenSession, setOpenSession, clearOpenSession, computeAutoClose } from "./session.js";
+import { log } from "./log";
+import { pushAnomaly } from "./anomalies";
+import { normalizeEmail, extractStampUtc, utcToBerlinLocalIso, berlinDayEnd } from "./timemoto";
+import { getEmployeeIdByEmail, createAttendance, patchAttendanceEnd } from "./personio";
+import { getOpenSession, setOpenSession, clearOpenSession, computeAutoClose } from "./session";
 
 const IDEMP_PREFIX = "idemp:event:"; // idemp:event:<eventId> = 1 (ttl)
 const IDEMP_TTL_SECONDS = 60 * 60 * 24 * 14; // 14 days
 
 export async function acquireIdempotency(redis: Redis, eventId: string): Promise<boolean> {
   const key = `${IDEMP_PREFIX}${eventId}`;
-  // NX set
   const ok = await redis.set(key, "1", { nx: true, ex: IDEMP_TTL_SECONDS });
   return ok === "OK";
 }
@@ -33,7 +32,12 @@ type TimemotoAttendance = {
 export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAttendance): Promise<void> {
   const email = normalizeEmail(ev?.data?.userEmployeeNumber);
   if (!email) {
-    await pushAnomaly(redis, { ts: new Date().toISOString(), type: "EMAIL_MISSING", eventId: ev.id, details: { event: ev.event } });
+    await pushAnomaly(redis, {
+      ts: new Date().toISOString(),
+      type: "EMAIL_MISSING",
+      eventId: ev.id,
+      details: { event: ev.event }
+    });
     log("warn", "attendance.ignored.email_missing", { eventId: ev.id });
     return;
   }
@@ -52,9 +56,16 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
 
   if (ev.data.clockingType === "In") {
     if (open) {
-      // DOUBLE-IN => auto-close previous at min(newIn, autoClose)
+      // DOUBLE-IN => close previous at min(newIn, autoClose)
       const endBerlin = open.autoCloseBerlin < stampBerlin ? open.autoCloseBerlin : stampBerlin;
-      await pushAnomaly(redis, { ts: new Date().toISOString(), type: "DOUBLE_IN", email, eventId: ev.id, details: { prevStart: open.startBerlin, newIn: stampBerlin, closedAt: endBerlin } });
+
+      await pushAnomaly(redis, {
+        ts: new Date().toISOString(),
+        type: "DOUBLE_IN",
+        email,
+        eventId: ev.id,
+        details: { prevStart: open.startBerlin, newIn: stampBerlin, closedAt: endBerlin }
+      });
 
       if (!env.SHADOW_MODE) await patchAttendanceEnd(env, redis, open.personioPeriodId, endBerlin);
       await clearOpenSession(redis, email);
@@ -62,6 +73,7 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
 
     const employeeId = await getEmployeeIdByEmail(env, redis, email);
     const periodId = env.SHADOW_MODE ? `shadow_${Date.now()}` : await createAttendance(env, redis, employeeId, stampBerlin);
+
     const autoCloseBerlin = computeAutoClose(stampBerlin);
 
     await setOpenSession(redis, {
@@ -79,19 +91,31 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
 
   // OUT
   if (!open) {
-    await pushAnomaly(redis, { ts: new Date().toISOString(), type: "OUT_WITHOUT_IN", email, eventId: ev.id, details: { out: stampBerlin } });
+    await pushAnomaly(redis, {
+      ts: new Date().toISOString(),
+      type: "OUT_WITHOUT_IN",
+      email,
+      eventId: ev.id,
+      details: { out: stampBerlin }
+    });
     log("warn", "attendance.out.without_in", { email, out: stampBerlin });
     return;
   }
 
   // guard
   if (stampBerlin < open.startBerlin) {
-    await pushAnomaly(redis, { ts: new Date().toISOString(), type: "OUT_BEFORE_IN", email, eventId: ev.id, details: { start: open.startBerlin, out: stampBerlin } });
+    await pushAnomaly(redis, {
+      ts: new Date().toISOString(),
+      type: "OUT_BEFORE_IN",
+      email,
+      eventId: ev.id,
+      details: { start: open.startBerlin, out: stampBerlin }
+    });
     log("warn", "attendance.out.before_in", { email });
     return;
   }
 
-  // clamp to 23:59 of start day (nachtschicht kommt bei euch nicht vor; wir halten es safe)
+  // clamp to 23:59 of start day
   const dayEnd = berlinDayEnd(open.startBerlin);
   const endBerlin = stampBerlin > dayEnd ? dayEnd : stampBerlin;
 
