@@ -1,16 +1,12 @@
-import Redis from "ioredis";
+import { createClient, type RedisClientType } from "redis";
 import type { Env } from "./env";
 import { log } from "./log";
 
-export type RedisClient = Redis;
+export type Redis = RedisClientType;
 
-export function createRedis(env: Env): RedisClient {
-  const r = new Redis(env.REDIS_URL, {
-    maxRetriesPerRequest: 2,
-    enableReadyCheck: true,
-    lazyConnect: true
-  });
-
-  r.on("error", (e) => log("warn", "redis.error", { err: String(e?.message ?? e) }));
-  return r;
+export async function createRedis(env: Env): Promise<Redis> {
+  const client = createClient({ url: env.REDIS_URL });
+  client.on("error", (err) => log("error", "redis.error", { err: String(err) }));
+  await client.connect();
+  return client;
 }
