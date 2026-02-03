@@ -20,8 +20,12 @@ export function extractStampUtc(ev: any): Date {
   if (typeof tl === "string") {
     const m = tl.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
     if (m) {
-      const y = Number(m[1]), mo = Number(m[2]), da = Number(m[3]);
-      const hh = Number(m[4]), mi = Number(m[5]), ss = Number(m[6]);
+      const y = Number(m[1]),
+        mo = Number(m[2]),
+        da = Number(m[3]);
+      const hh = Number(m[4]),
+        mi = Number(m[5]),
+        ss = Number(m[6]);
       return zonedLocalToUtcDate(y, mo, da, hh, mi, ss, TZ);
     }
   }
@@ -72,14 +76,8 @@ function partsInTimeZone(date: Date, timeZone: string) {
 
 function getOffsetMinutes(date: Date, timeZone: string): number {
   const p = partsInTimeZone(date, timeZone);
-  const asUtc = Date.UTC(
-    Number(p.y),
-    Number(p.mo) - 1,
-    Number(p.d),
-    Number(p.h),
-    Number(p.mi),
-    Number(p.s)
-  );
+  const asUtc = Date.UTC(Number(p.y), Number(p.mo) - 1, Number(p.d), Number(p.h), Number(p.mi), Number(p.s));
+  // if local time is ahead of UTC, offset is positive
   return Math.round((asUtc - date.getTime()) / 60000);
 }
 
@@ -92,8 +90,10 @@ function zonedLocalToUtcDate(
   second: number,
   timeZone: string
 ): Date {
+  // initial guess: treat local as UTC
   let utcMillis = Date.UTC(year, month - 1, day, hour, minute, second);
 
+  // refine 2x for DST correctness
   for (let i = 0; i < 2; i++) {
     const guessDate = new Date(utcMillis);
     const offset = getOffsetMinutes(guessDate, timeZone);
@@ -104,9 +104,22 @@ function zonedLocalToUtcDate(
 }
 
 /**
- * TimeMoto signature verification (robust):
- * - supports hex or base64 digest
- * - supports headers like: "sha256=<sig>", "t=...,v1=<sig>", "<sig>"
+ * TimeMoto signature verification (robust, safe):
+ * Accepts common provider encodings/variants:
+ * - HMAC-SHA256(secret, rawBody) encoded as:
+ *   - hex
+ *   - base64
+ *   - base64url (no padding)
+ * - Compatibility fallbacks (still secret-based):
+ *   - SHA256(rawBody + secret)
+ *   - SHA256(secret + rawBody)
+ *
+ * Header formats supported:
+ * - "<sig>"
+ * - "sha256=<sig>"
+ * - "t=...,v1=<sig>"
+ * - "v1=<sig>"
+ * - "signature=<sig>"
  */
 export function verifyTimemotoSignature(
   rawBody: Buffer,
@@ -118,23 +131,26 @@ export function verifyTimemotoSignature(
   const provided = extractSignatureToken(signatureHeader);
   if (!provided) return false;
 
-  const h = crypto.createHmac("sha256", secret).update(rawBody);
-  const expectedHex = h.digest("hex");
+  const cand: string[] = [];
 
-  const h2 = crypto.createHmac("sha256", secret).update(rawBody);
-  const expectedB64 = h2.digest("base64");
+  // HMAC-SHA256
+  const hmacBytes = crypto.createHmac("sha256", secret).update(rawBody).digest();
+  cand.push(hmacBytes.toString("hex"));
+  cand.push(hmacBytes.toString("base64"));
+  cand.push(toBase64UrlNoPad(hmacBytes.toString("base64")));
 
-  return safeEqual(provided, expectedHex) || safeEqual(provided, expectedB64);
+  // Compatibility fallbacks (still secret-protected)
+  const sha1 = crypto.createHash("sha256").update(Buffer.concat([rawBody, Buffer.from(secret, "utf8")])).digest("hex");
+  const sha2 = crypto.createHash("sha256").update(Buffer.concat([Buffer.from(secret, "utf8"), rawBody])).digest("hex");
+  cand.push(sha1);
+  cand.push(sha2);
+
+  return cand.some((c) => signatureEquals(provided, c));
 }
 
 function extractSignatureToken(headerValue: string): string | null {
   const v = headerValue.trim();
 
-  // Common patterns:
-  // - "sha256=<sig>"
-  // - "t=123,v1=<sig>"
-  // - "v1=<sig>"
-  // - plain "<sig>"
   const m1 = v.match(/sha256=([A-Za-z0-9+/=._-]+)/i);
   if (m1?.[1]) return m1[1];
 
@@ -144,7 +160,6 @@ function extractSignatureToken(headerValue: string): string | null {
   const m3 = v.match(/signature=([A-Za-z0-9+/=._-]+)/i);
   if (m3?.[1]) return m3[1];
 
-  // if comma-separated, try last token
   if (v.includes(",")) {
     const parts = v.split(",").map((s) => s.trim());
     for (let i = parts.length - 1; i >= 0; i--) {
@@ -158,12 +173,35 @@ function extractSignatureToken(headerValue: string): string | null {
   return v.length > 10 ? v : null;
 }
 
-function safeEqual(a: string, b: string): boolean {
-  const aa = a.trim();
-  const bb = b.trim();
-  if (aa.length !== bb.length) return false;
+function signatureEquals(providedRaw: string, expectedRaw: string): boolean {
+  // normalize both sides for:
+  // - hex case
+  // - base64 padding
+  // - base64url variants
+  const p = normalizeSig(providedRaw);
+  const e = normalizeSig(expectedRaw);
 
-  const ba = Buffer.from(aa);
-  const bb2 = Buffer.from(bb);
-  return crypto.timingSafeEqual(ba, bb2);
+  if (p.length !== e.length) return false;
+
+  // timing safe compare
+  const pb = Buffer.from(p, "utf8");
+  const eb = Buffer.from(e, "utf8");
+  return crypto.timingSafeEqual(pb, eb);
+}
+
+function normalizeSig(s: string): string {
+  const v = s.trim();
+
+  // If it looks like hex -> normalize to lowercase hex
+  if (/^[0-9a-fA-F]{64}$/.test(v)) return v.toLowerCase();
+
+  // base64/base64url:
+  // 1) convert urlsafe to standard
+  // 2) remove padding (because some providers omit it)
+  const std = v.replace(/-/g, "+").replace(/_/g, "/");
+  return std.replace(/=+$/g, "");
+}
+
+function toBase64UrlNoPad(b64: string): string {
+  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
