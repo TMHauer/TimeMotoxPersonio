@@ -34,6 +34,11 @@ export function computeAutoClose(startBerlin: string): string {
 
 export async function dueAutoCloses(redis: Redis, nowEpochSeconds: number, limit = 50): Promise<string[]> {
   // returns emails
-  const emails = await redis.zrange<string[]>(AUTOCLOSE_ZSET, 0, nowEpochSeconds, { byScore: true, limit: { offset: 0, count: limit } });
+ const emails = await redis.zrange<string[]>(
+  AUTOCLOSE_ZSET,
+  0,
+  nowEpochSeconds,
+  { byScore: true, offset: 0, count: limit }
+);
   return emails ?? [];
 }
