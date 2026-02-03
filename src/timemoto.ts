@@ -1,211 +1,109 @@
 import crypto from "node:crypto";
+import { DateTime } from "luxon";
 
-const TZ = "Europe/Berlin";
-
-export type TimeMotoWebhook = {
-  id: string;
-  event: string;
-  sequence?: number;
-  dispatchedAt?: number;
-  data?: any;
-};
-
-// ----------------------
-// Email helpers
-// ----------------------
-export function normalizeEmail(s: any): string | null {
-  if (typeof s !== "string") return null;
-  const e = s.trim().toLowerCase();
-  return e.includes("@") ? e : null;
+export function normalizeEmail(v: string): string {
+  return v.trim().toLowerCase();
 }
 
-export function extractEmail(body: TimeMotoWebhook): string | null {
-  return (
-    normalizeEmail(body?.data?.userEmployeeNumber) ??
-    normalizeEmail(body?.data?.emailAddress) ??
-    null
-  );
+export function extractEmailFromEvent(body: any): string | null {
+  const n = body?.data?.userEmployeeNumber;
+  if (typeof n === "string" && n.includes("@")) return normalizeEmail(n);
+  // fallback (less ideal)
+  const e = body?.data?.emailAddress;
+  if (typeof e === "string" && e.includes("@")) return normalizeEmail(e);
+  return null;
 }
 
-// ----------------------
-// Time helpers
-// ----------------------
+export function extractStampUtcMillis(body: any): number | null {
+  const tz = (typeof body?.data?.timeZone === "string" && body.data.timeZone) || "Europe/Berlin";
+  const iso =
+    body?.data?.timeLoggedRounded ??
+    body?.data?.timeLogged ??
+    body?.data?.timeInserted;
 
-// Prefer UTC "timeInserted" (ends with Z). Fallback to "timeLogged" (Berlin local)
-export function extractStampUtc(body: any): Date {
-  const ti = body?.data?.timeInserted;
-  if (typeof ti === "string") {
-    const d = new Date(ti);
-    if (!Number.isNaN(d.getTime())) return d;
-  }
+  if (typeof iso !== "string") return null;
 
-  const tl = body?.data?.timeLogged ?? body?.data?.timeLoggedRounded;
-  if (typeof tl === "string") {
-    // "2026-02-02T17:06:00" (no Z) → treat as Berlin local
-    const m = tl.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
-    if (m) {
-      const y = Number(m[1]),
-        mo = Number(m[2]),
-        da = Number(m[3]);
-      const hh = Number(m[4]),
-        mi = Number(m[5]),
-        ss = Number(m[6]);
-      return zonedLocalToUtcDate(y, mo, da, hh, mi, ss, TZ);
-    }
-    const d = new Date(tl);
-    if (!Number.isNaN(d.getTime())) return d;
-  }
-
-  return new Date();
+  // timeLogged often has no offset -> interpret in provided timeZone
+  // timeInserted is usually Z -> Luxon handles it fine
+  const dt = DateTime.fromISO(iso, { zone: tz });
+  if (!dt.isValid) return null;
+  return dt.toUTC().toMillis();
 }
 
-export function extractStampUtcMillis(body: any): number {
-  return extractStampUtc(body).getTime();
+export function toBerlinISO(utcMillis: number): string {
+  return DateTime.fromMillis(utcMillis, { zone: "utc" })
+    .setZone("Europe/Berlin")
+    .toISO({ suppressMilliseconds: true }) as string;
 }
 
-/**
- * Berlin ISO with offset, e.g. 2026-02-03T12:38:22+01:00
- * (Good for debugging + Personio usually accepts date_time with offset.)
- */
-export function toBerlinISO(dateUtc: Date): string {
-  const p = partsInTimeZone(dateUtc, TZ);
-  const offsetMin = getOffsetMinutes(dateUtc, TZ);
-  const sign = offsetMin >= 0 ? "+" : "-";
-  const abs = Math.abs(offsetMin);
-  const oh = String(Math.floor(abs / 60)).padStart(2, "0");
-  const om = String(abs % 60).padStart(2, "0");
-  return `${p.y}-${p.mo}-${p.d}T${p.h}:${p.mi}:${p.s}${sign}${oh}:${om}`;
+export function berlinDayEndUtcMillis(utcMillis: number): number {
+  const berlin = DateTime.fromMillis(utcMillis, { zone: "utc" }).setZone("Europe/Berlin");
+  const end = berlin.set({ hour: 23, minute: 59, second: 0, millisecond: 0 });
+  return end.toUTC().toMillis();
 }
 
-/**
- * Berlin local without offset, e.g. 2026-02-03T12:38:22
- * (Some Personio setups are picky; this format is also widely accepted.)
- */
-export function toBerlinLocalNoOffset(msUtc: number): string {
-  const dt = new Date(msUtc);
-  const parts = new Intl.DateTimeFormat("sv-SE", {
-    timeZone: TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hourCycle: "h23"
-  }).formatToParts(dt);
-
-  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
-  return `${get("year")}-${get("month")}-${get("day")}T${get("hour")}:${get("minute")}:${get("second")}`;
+function timingSafeEq(a: string, b: string): boolean {
+  const ab = Buffer.from(a, "utf8");
+  const bb = Buffer.from(b, "utf8");
+  if (ab.length !== bb.length) return false;
+  return crypto.timingSafeEqual(ab, bb);
 }
 
-/**
- * Berlin day end 23:59 for the day of "start", returned as UTC millis.
- * Accepts Date OR number (fixes your TS error "Date not assignable to number").
- */
-export function berlinDayEndUtcMillis(start: Date | number): number {
-  const d = typeof start === "number" ? new Date(start) : start;
-  const p = partsInTimeZone(d, TZ);
-  const endUtc = zonedLocalToUtcDate(Number(p.y), Number(p.mo), Number(p.d), 23, 59, 0, TZ);
-  return endUtc.getTime();
+function looksBase64(s: string): boolean {
+  return /^[A-Za-z0-9+/=_-]+$/.test(s) && s.length >= 16;
 }
 
-// ----------------------
-// Signature verification
-// ----------------------
-
-/**
- * TimeMoto sends header "timemoto-signature" (64 hex).
- * We assume HMAC-SHA256 hex over RAW body with secret (common webhook pattern).
- */
-export function verifyTimemotoSignature(rawBody: Buffer, signatureHeader: string | undefined | null, secret: string): boolean {
-  if (!signatureHeader) return false;
-  const provided = signatureHeader.trim().toLowerCase();
-  const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex").toLowerCase();
-
+function base64ToBuf(s: string): Buffer | null {
   try {
-    const a = Buffer.from(provided, "utf8");
-    const b = Buffer.from(expected, "utf8");
-    if (a.length !== b.length) return false;
-    return crypto.timingSafeEqual(a, b);
+    const norm = s.replace(/-/g, "+").replace(/_/g, "/");
+    return Buffer.from(norm, "base64");
   } catch {
-    return false;
+    return null;
   }
 }
 
-export function signatureDebugCandidates(rawBody: Buffer, secret: string): string[] {
-  const h = crypto.createHmac("sha256", secret).update(rawBody).digest();
-  const hex = h.toString("hex");
-  const b64 = h.toString("base64");
-  const b64url = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-  return [hex, b64, b64url];
-}
+export function verifyTimemotoSignature(rawBody: Buffer, headerSig: string, secret: string): boolean {
+  const sig = (headerSig ?? "").trim();
+  if (!sig) return false;
 
-// ----------------------
-// Event helpers
-// ----------------------
+  const candidates: Buffer[] = [];
 
-export function isAttendanceEvent(body: TimeMotoWebhook): boolean {
-  return String(body?.event ?? "").startsWith("attendance.");
-}
+  // 1) secret as utf8
+  candidates.push(Buffer.from(secret, "utf8"));
 
-export function isIn(body: TimeMotoWebhook): boolean {
-  return String(body?.data?.clockingType ?? "").toLowerCase() === "in";
-}
-
-export function isOut(body: TimeMotoWebhook): boolean {
-  return String(body?.data?.clockingType ?? "").toLowerCase() === "out";
-}
-
-// ----------------------
-// Internal TZ utils
-// ----------------------
-
-function partsInTimeZone(date: Date, timeZone: string) {
-  const dtf = new Intl.DateTimeFormat("en-CA", {
-    timeZone,
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit"
-  });
-
-  const parts = dtf.formatToParts(date);
-  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
-  return {
-    y: get("year"),
-    mo: get("month"),
-    d: get("day"),
-    h: get("hour"),
-    mi: get("minute"),
-    s: get("second")
-  };
-}
-
-function getOffsetMinutes(date: Date, timeZone: string): number {
-  const p = partsInTimeZone(date, timeZone);
-  const asUtc = Date.UTC(Number(p.y), Number(p.mo) - 1, Number(p.d), Number(p.h), Number(p.mi), Number(p.s));
-  return Math.round((asUtc - date.getTime()) / 60000);
-}
-
-function zonedLocalToUtcDate(
-  year: number,
-  month: number,
-  day: number,
-  hour: number,
-  minute: number,
-  second: number,
-  timeZone: string
-): Date {
-  let utcMillis = Date.UTC(year, month - 1, day, hour, minute, second);
-
-  for (let i = 0; i < 2; i++) {
-    const guess = new Date(utcMillis);
-    const offset = getOffsetMinutes(guess, timeZone);
-    utcMillis = Date.UTC(year, month - 1, day, hour, minute, second) - offset * 60000;
+  // 2) secret as base64 decoded (common gotcha)
+  if (looksBase64(secret)) {
+    const b = base64ToBuf(secret);
+    if (b && b.length > 0) candidates.push(b);
   }
 
-  return new Date(utcMillis);
+  // 3) secret as hex decoded
+  if (/^[0-9a-fA-F]+$/.test(secret) && secret.length % 2 === 0) {
+    try {
+      candidates.push(Buffer.from(secret, "hex"));
+    } catch {
+      // ignore
+    }
+  }
+
+  // compare against hex signature (most common: 64 hex chars)
+  for (const key of candidates) {
+    const h = crypto.createHmac("sha256", key).update(rawBody).digest("hex");
+    if (timingSafeEq(h.toLowerCase(), sig.toLowerCase())) return true;
+
+    // sometimes sent as base64
+    const b64 = crypto.createHmac("sha256", key).update(rawBody).digest("base64");
+    if (timingSafeEq(b64, sig)) return true;
+
+    const b64url = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    if (timingSafeEq(b64url, sig)) return true;
+  }
+
+  return false;
+}
+
+export function getClockingType(body: any): "In" | "Out" | null {
+  const t = body?.data?.clockingType;
+  if (t === "In" || t === "Out") return t;
+  return null;
 }
