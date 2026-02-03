@@ -1,9 +1,9 @@
-import { loadEnv } from "./env";
-import { createRedis } from "./redis";
-import { log } from "./log";
-import { dueAutoCloses, getOpenSession, clearOpenSession } from "./session";
-import { patchAttendanceEnd } from "./personio";
-import { pushAnomaly } from "./anomalies";
+import { loadEnv } from "./env.js";
+import { createRedis } from "./redis.js";
+import { log } from "./log.js";
+import { dueAutoCloses, getOpenSession, clearOpenSession } from "./session.js";
+import { patchAttendanceEnd } from "./personio.js";
+import { pushAnomaly } from "./anomalies.js";
 
 const env = loadEnv();
 const redis = createRedis(env);
