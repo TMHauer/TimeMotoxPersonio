@@ -1,8 +1,8 @@
-import { createClient, type RedisClientType } from "redis";
+import { createClient } from "redis";
 import type { Env } from "./env";
 import { log } from "./log";
 
-export type Redis = RedisClientType;
+export type Redis = ReturnType<typeof createClient>;
 
 export async function createRedis(env: Env): Promise<Redis> {
   const client = createClient({ url: env.REDIS_URL });
