@@ -3,9 +3,7 @@ import type { Redis } from "./redis";
 import { log } from "./log";
 
 function formEncode(obj: Record<string, string>): string {
-  return Object.entries(obj)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
-    .join("&");
+  return new URLSearchParams(obj).toString();
 }
 
 async function personioFetch(env: Env, path: string, init: RequestInit): Promise<Response> {
