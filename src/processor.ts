@@ -4,7 +4,13 @@ import { log } from "./log.js";
 import { pushAnomaly } from "./anomalies.js";
 import { normalizeEmail, extractStampUtc, toBerlinISO, berlinDayEndUtcMillis } from "./timemoto.js";
 import { getEmployeeIdByEmail, createAttendance, patchAttendanceEnd } from "./personio.js";
-import { getOpenSession, setOpenSession, clearOpenSession, computeAutoCloseUtcMillis, upsertAutoCloseIndex } from "./session.js";
+import {
+  getOpenSession,
+  setOpenSession,
+  clearOpenSession,
+  computeAutoCloseUtcMillis,
+  upsertAutoCloseIndex
+} from "./session.js";
 
 const IDEMP_PREFIX = "idemp:event:";
 const IDEMP_TTL_SECONDS = 60 * 60 * 24 * 14;
@@ -53,9 +59,13 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
 
   const open = await getOpenSession(redis, email);
 
+  // -------------------------
+  // IN
+  // -------------------------
   if (ev.data.clockingType === "In") {
+    // If there is already an open session -> DOUBLE_IN
     if (open) {
-      // DOUBLE-IN: close previous session at min(newIn, autoClose)
+      // close previous session at min(newIn, autoClose)
       const endUtcMillis = Math.min(stampUtc.getTime(), open.autoCloseUtcMillis);
       const endBerlin = toBerlinISO(new Date(endUtcMillis));
 
@@ -67,12 +77,17 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
         details: { prevStart: open.startBerlin, newIn: stampBerlin, closedAt: endBerlin }
       });
 
-      if (!env.SHADOW_MODE) await patchAttendanceEnd(env, redis, open.personioPeriodId, endBerlin);
+      if (!env.SHADOW_MODE) {
+        await patchAttendanceEnd(env, redis, open.personioPeriodId, endBerlin);
+      }
       await clearOpenSession(redis, email);
     }
 
+    // create new session
     const employeeId = await getEmployeeIdByEmail(env, redis, email);
-    const periodId = env.SHADOW_MODE ? `shadow_${Date.now()}` : await createAttendance(env, redis, employeeId, stampBerlin);
+    const periodId = env.SHADOW_MODE
+      ? `shadow_${Date.now()}`
+      : await createAttendance(env, redis, employeeId, stampBerlin);
 
     const autoCloseUtcMillis = computeAutoCloseUtcMillis(stampUtc);
     const autoCloseBerlin = toBerlinISO(new Date(autoCloseUtcMillis));
@@ -99,7 +114,9 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
     return;
   }
 
+  // -------------------------
   // OUT
+  // -------------------------
   if (!open) {
     await pushAnomaly(redis, {
       ts: new Date().toISOString(),
@@ -108,4 +125,32 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
       eventId: ev.id,
       details: { out: stampBerlin }
     });
-    log("warn", "attendance.ou
+    log("warn", "attendance.out.without_in", { email, out: stampBerlin });
+    return;
+  }
+
+  if (stampUtc.getTime() < open.startUtcMillis) {
+    await pushAnomaly(redis, {
+      ts: new Date().toISOString(),
+      type: "OUT_BEFORE_IN",
+      email,
+      eventId: ev.id,
+      details: { start: open.startBerlin, out: stampBerlin }
+    });
+    log("warn", "attendance.out.before_in", { email, start: open.startBerlin, out: stampBerlin });
+    return;
+  }
+
+  // clamp end to Berlin day end of the start day
+  const dayEndUtc = berlinDayEndUtcMillis(new Date(open.startUtcMillis));
+  const endUtcMillis = Math.min(stampUtc.getTime(), dayEndUtc);
+  const endBerlin = toBerlinISO(new Date(endUtcMillis));
+
+  if (!env.SHADOW_MODE) {
+    await patchAttendanceEnd(env, redis, open.personioPeriodId, endBerlin);
+  }
+
+  await clearOpenSession(redis, email);
+
+  log("info", "attendance.out.processed", { email, endBerlin, shadow: env.SHADOW_MODE });
+}
