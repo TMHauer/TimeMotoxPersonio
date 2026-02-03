@@ -1,84 +1,76 @@
 import crypto from "node:crypto";
 
-export type TimemotoEvent = {
-  id: string;
-  event: string; // attendance.inserted | attendance.updated | user.updated | ...
-  sequence?: number;
-  dispatchedAt?: number;
-  data: any;
-};
+const TZ = "Europe/Berlin";
 
-/**
- * TimeMoto sends header: timemoto-signature
- * Expected: hex string of HMAC-SHA256 over the RAW request body using your shared secret.
- */
+export function normalizeEmail(s: any): string | null {
+  if (typeof s !== "string") return null;
+  const e = s.trim().toLowerCase();
+  return e.includes("@") ? e : null;
+}
+
+function timingSafeEqualHex(a: string, b: string): boolean {
+  const aa = a.toLowerCase();
+  const bb = b.toLowerCase();
+  if (aa.length !== bb.length) return false;
+  let out = 0;
+  for (let i = 0; i < aa.length; i++) out |= aa.charCodeAt(i) ^ bb.charCodeAt(i);
+  return out === 0;
+}
+
 export function verifyTimemotoSignature(
   rawBody: Buffer,
   signatureHeader: string | undefined | null,
   secret: string
 ): boolean {
   if (!signatureHeader) return false;
-
   const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-
-  // constant-time compare (must be same length)
-  const a = Buffer.from(signatureHeader.trim(), "utf8");
-  const b = Buffer.from(expected, "utf8");
-  if (a.length !== b.length) return false;
-  return crypto.timingSafeEqual(a, b);
+  return timingSafeEqualHex(expected, signatureHeader);
 }
 
-export function normalizeEmail(v: unknown): string | null {
-  if (typeof v !== "string") return null;
-  const e = v.trim().toLowerCase();
-  if (!e.includes("@")) return null;
-  return e;
-}
-
-/**
- * Prefer timeLogged (Berlin local without offset) using timeZone, fallback to timeInserted (UTC Z).
- * - timeLogged example: "2026-02-02T17:06:00" (no Z) + timeZone "Europe/Berlin"
- * - timeInserted example: "2026-02-02T16:06:10Z"
- */
-export function extractStampUtc(ev: TimemotoEvent): Date {
-  const tz = String(ev?.data?.timeZone ?? "Europe/Berlin");
-  const timeLogged = ev?.data?.timeLogged as string | undefined;
-  const timeInserted = ev?.data?.timeInserted as string | undefined;
-
-  if (timeLogged && tz === "Europe/Berlin") {
-    return berlinLocalToUtc(normalizeLocalIso(timeLogged));
+// Prefer timeInserted (UTC Z). Fallback to timeLogged (assume Berlin local)
+export function extractStampUtc(ev: any): Date {
+  const ti = ev?.data?.timeInserted;
+  if (typeof ti === "string" && ti.endsWith("Z")) {
+    const d = new Date(ti);
+    if (!Number.isNaN(d.getTime())) return d;
   }
-  if (timeInserted) return new Date(timeInserted);
-  if (typeof ev.dispatchedAt === "number") return new Date(ev.dispatchedAt * 1000);
 
-  throw new Error("No timestamp in event (timeLogged/timeInserted/dispatchedAt missing)");
+  const tl = ev?.data?.timeLogged;
+  if (typeof tl === "string") {
+    // timeLogged e.g. "2026-02-02T17:06:00" in Europe/Berlin
+    const m = tl.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
+    if (m) {
+      const y = Number(m[1]), mo = Number(m[2]), da = Number(m[3]);
+      const hh = Number(m[4]), mi = Number(m[5]), ss = Number(m[6]);
+      return zonedLocalToUtcDate(y, mo, da, hh, mi, ss, TZ);
+    }
+  }
+
+  return new Date();
 }
 
-/**
- * Normalize strings like "2026-02-02T17:06:00.123" -> "2026-02-02T17:06:00"
- */
-function normalizeLocalIso(s: string): string {
-  const trimmed = s.trim();
-  // Keep only "YYYY-MM-DDTHH:mm:ss"
-  if (trimmed.length >= 19) return trimmed.slice(0, 19);
-  return trimmed;
+// Convert UTC instant to ISO string with Berlin offset, e.g. 2026-02-02T17:06:00+01:00
+export function toBerlinISO(dateUtc: Date): string {
+  const parts = partsInTimeZone(dateUtc, TZ);
+  const offsetMin = getOffsetMinutes(dateUtc, TZ);
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const abs = Math.abs(offsetMin);
+  const oh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const om = String(abs % 60).padStart(2, "0");
+  return `${parts.y}-${parts.mo}-${parts.d}T${parts.h}:${parts.mi}:${parts.s}${sign}${oh}:${om}`;
 }
 
-/**
- * Convert "YYYY-MM-DDTHH:mm:ss" interpreted as Europe/Berlin local time to UTC Date.
- * DST-safe via Intl offset trick.
- */
-export function berlinLocalToUtc(localIso: string): Date {
-  const [d, t] = localIso.split("T");
-  const [Y, M, D] = d.split("-").map(Number);
-  const [h, mi, s] = t.split(":").map(Number);
+export function berlinDayEndUtcMillis(startUtc: Date): number {
+  // get Berlin local date of the start
+  const p = partsInTimeZone(startUtc, TZ);
+  // 23:59:00 local
+  const endUtc = zonedLocalToUtcDate(Number(p.y), Number(p.mo), Number(p.d), 23, 59, 0, TZ);
+  return endUtc.getTime();
+}
 
-  // Construct a UTC date with same components (temporary anchor)
-  const asUtc = new Date(Date.UTC(Y, M - 1, D, h, mi, s || 0));
-
-  // Format that instant in Europe/Berlin to derive its local components
-  const fmt = new Intl.DateTimeFormat("en-US", {
-    timeZone: "Europe/Berlin",
+function partsInTimeZone(date: Date, timeZone: string) {
+  const dtf = new Intl.DateTimeFormat("en-CA", {
+    timeZone,
     hour12: false,
     year: "numeric",
     month: "2-digit",
@@ -88,64 +80,50 @@ export function berlinLocalToUtc(localIso: string): Date {
     second: "2-digit"
   });
 
-  const parts = fmt.formatToParts(asUtc);
-  const yy = Number(parts.find(p => p.type === "year")!.value);
-  const mm = Number(parts.find(p => p.type === "month")!.value);
-  const dd = Number(parts.find(p => p.type === "day")!.value);
-  const hh = Number(parts.find(p => p.type === "hour")!.value);
-  const mii = Number(parts.find(p => p.type === "minute")!.value);
-  const ss = Number(parts.find(p => p.type === "second")!.value);
-
-  // berlinAsUtc is the UTC instant that would show the Berlin-local wall clock values
-  const berlinAsUtc = new Date(Date.UTC(yy, mm - 1, dd, hh, mii, ss));
-  const offsetMs = berlinAsUtc.getTime() - asUtc.getTime();
-
-  // localIso was Berlin local, so actual UTC instant is anchor minus offset
-  return new Date(asUtc.getTime() - offsetMs);
+  const parts = dtf.formatToParts(date);
+  const get = (t: string) => parts.find(p => p.type === t)?.value ?? "00";
+  return {
+    y: get("year"),
+    mo: get("month"),
+    d: get("day"),
+    h: get("hour"),
+    mi: get("minute"),
+    s: get("second")
+  };
 }
 
-/**
- * Convert UTC Date to Berlin local ISO-like string "YYYY-MM-DDTHH:mm:ss" (no offset).
- */
-export function utcToBerlinLocalIso(dtUtc: Date): string {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Berlin",
-    hour12: false,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit"
-  });
-
-  const parts = fmt.formatToParts(dtUtc);
-  const y = parts.find(p => p.type === "year")!.value;
-  const m = parts.find(p => p.type === "month")!.value;
-  const d = parts.find(p => p.type === "day")!.value;
-  const hh = parts.find(p => p.type === "hour")!.value;
-  const mi = parts.find(p => p.type === "minute")!.value;
-  const ss = parts.find(p => p.type === "second")!.value;
-
-  return `${y}-${m}-${d}T${hh}:${mi}:${ss}`;
+function getOffsetMinutes(date: Date, timeZone: string): number {
+  const p = partsInTimeZone(date, timeZone);
+  const asUtc = Date.UTC(
+    Number(p.y),
+    Number(p.mo) - 1,
+    Number(p.d),
+    Number(p.h),
+    Number(p.mi),
+    Number(p.s)
+  );
+  // if local time is ahead of UTC, offset is positive
+  return Math.round((asUtc - date.getTime()) / 60000);
 }
 
-/**
- * 23:59 of the start day (Berlin local) for "YYYY-MM-DDTHH:mm:ss"
- */
-export function berlinDayEnd(berlinIso: string): string {
-  return `${berlinIso.slice(0, 10)}T23:59:00`;
-}
+function zonedLocalToUtcDate(
+  year: number,
+  month: number,
+  day: number,
+  hour: number,
+  minute: number,
+  second: number,
+  timeZone: string
+): Date {
+  // initial guess: treat local as UTC
+  let utcMillis = Date.UTC(year, month - 1, day, hour, minute, second);
 
-/**
- * Add hours to a Berlin-local iso time, DST-safe by converting via UTC.
- */
-export function addHoursBerlin(berlinIso: string, hours: number): string {
-  const utc = berlinLocalToUtc(berlinIso);
-  const plus = new Date(utc.getTime() + hours * 3600_000);
-  return utcToBerlinLocalIso(plus);
-}
+  // refine 2x for DST correctness
+  for (let i = 0; i < 2; i++) {
+    const guessDate = new Date(utcMillis);
+    const offset = getOffsetMinutes(guessDate, timeZone);
+    utcMillis = Date.UTC(year, month - 1, day, hour, minute, second) - offset * 60000;
+  }
 
-export function minIso(a: string, b: string): string {
-  return a < b ? a : b;
+  return new Date(utcMillis);
 }
