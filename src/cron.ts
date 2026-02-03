@@ -1,59 +1,41 @@
-import { loadEnv } from "./env.js";
-import { createRedis } from "./redis.js";
-import { log } from "./log.js";
-import { dueAutoCloses, getOpenSession, clearOpenSession } from "./session.js";
-import { patchAttendanceEnd } from "./personio.js";
-import { pushAnomaly } from "./anomalies.js";
+import type { Env } from "./env";
+import type { RedisClient } from "./redis";
+import { log } from "./log";
+import { patchAttendanceEnd } from "./personio";
+import { clearOpen, getOpen, pushHistory } from "./session";
+import { toBerlinLocalNoOffset } from "./timemoto";
 
-const env = loadEnv();
-const redis = createRedis(env);
+const AUTOCLOSE_ZSET = "session:autoclose";
 
-async function runOnce() {
-  const nowEpoch = Math.floor(Date.now() / 1000);
-  const emails = await dueAutoCloses(redis as any, nowEpoch, 100);
-
-  if (emails.length === 0) {
-    log("info", "cron.no_due_autoclose");
-    return;
-  }
-
-  log("info", "cron.due_autoclose", { count: emails.length });
+export async function runAutoClose(env: Env, redis: RedisClient): Promise<{ closed: number }> {
+  const now = Date.now();
+  // get up to 50 due sessions
+  const emails = await redis.zrangebyscore(AUTOCLOSE_ZSET, 0, now, "LIMIT", 0, 50);
+  let closed = 0;
 
   for (const email of emails) {
-    const open = await getOpenSession(redis as any, email);
-    if (!open) {
-      await clearOpenSession(redis as any, email);
+    const s = await getOpen(redis, email);
+    if (!s) {
+      await redis.zrem(AUTOCLOSE_ZSET, email);
       continue;
     }
+    if (s.autoCloseAtUtc > now) continue;
 
-    try {
-      if (!env.SHADOW_MODE) {
-        await patchAttendanceEnd(env, redis as any, open.personioPeriodId, open.autoCloseBerlin);
-      }
-      await clearOpenSession(redis as any, email);
+    const endBerlin = toBerlinLocalNoOffset(s.autoCloseAtUtc);
 
-      await pushAnomaly(redis as any, {
-        ts: new Date().toISOString(),
-        type: "AUTO_CLOSED",
-        email,
-        details: { end: open.autoCloseBerlin }
-      });
-
-      log("info", "cron.autoclosed", { email, end: open.autoCloseBerlin, shadow: env.SHADOW_MODE });
-    } catch (e: any) {
-      await pushAnomaly(redis as any, {
-        ts: new Date().toISOString(),
-        type: "AUTO_CLOSE_FAILED",
-        email,
-        details: { err: String(e?.message ?? e) }
-      });
-
-      log("error", "cron.autoclose_failed", { email, err: String(e?.message ?? e) });
-    }
+    await patchAttendanceEnd(env, redis, s.periodId, endBerlin);
+    await pushHistory(redis, email, {
+      start: s.startBerlin,
+      end: endBerlin,
+      end_reason: "AUTO_CLOSE",
+      periodId: s.periodId,
+      openedEventId: s.openedEventId,
+      ts: new Date().toISOString()
+    });
+    await clearOpen(redis, email);
+    closed++;
+    log("info", "attendance.autoclosed", { email, periodId: s.periodId, end: endBerlin });
   }
-}
 
-runOnce().catch((e) => {
-  log("error", "cron.fatal", { err: String((e as any)?.message ?? e) });
-  process.exit(1);
-});
+  return { closed };
+}
