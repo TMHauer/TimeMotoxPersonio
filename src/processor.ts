@@ -13,14 +13,12 @@ import { getOpenSession, setOpenSession, clearOpenSession, pushHistory, type Ope
 import { getEmployeeIdByEmail, createAttendanceOpenEnded, patchAttendanceEnd } from "./personio";
 
 async function markEventOnce(redis: Redis, eventId: string): Promise<boolean> {
-  // true = first time, false = duplicate
   const key = `evt:${eventId}`;
   const res = await redis.set(key, "1", { NX: true, EX: 7 * 24 * 3600 });
   return res === "OK";
 }
 
 async function markPunchOnce(redis: Redis, email: string, clockingType: "In" | "Out", stampUtc: number): Promise<boolean> {
-  // Dedup across re-deliveries where eventId changes but punch is same
   const key = `punch:${email}:${clockingType}:${stampUtc}`;
   const res = await redis.set(key, "1", { NX: true, EX: 7 * 24 * 3600 });
   return res === "OK";
@@ -32,6 +30,10 @@ function clampAutoClose(utcStart: number): number {
   return Math.min(twelveH, dayEnd);
 }
 
+function isShadowPeriodId(id: string): boolean {
+  return !id || id === "shadow-period" || id.startsWith("shadow");
+}
+
 export async function handleAttendance(env: Env, redis: Redis, body: any): Promise<void> {
   const eventId = String(body?.id ?? "");
   if (!eventId) {
@@ -39,7 +41,6 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
     return;
   }
 
-  // Event-id dedup (cheap early exit)
   const firstById = await markEventOnce(redis, eventId);
   if (!firstById) {
     log("info", "attendance.duplicate_event_id", { eventId });
@@ -64,7 +65,6 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
     return;
   }
 
-  // Punch dedup (handles re-deliveries where eventId differs)
   const firstPunch = await markPunchOnce(redis, email, clockingType, stampUtc);
   if (!firstPunch) {
     log("info", "attendance.duplicate_punch", { email, clockingType, stampUtc, eventId });
@@ -73,6 +73,9 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
 
   const stampBerlinISO = toBerlinISO(stampUtc);
 
+  // =========================
+  // IN
+  // =========================
   if (clockingType === "In") {
     const existing = await getOpenSession(redis, email);
 
@@ -89,9 +92,23 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
       });
 
       if (!env.SHADOW_MODE) {
-        await patchAttendanceEnd(env, redis, existing.personioPeriodId, closeBerlin);
+        // If existing was shadow, we cannot patch it — just clear it.
+        if (!isShadowPeriodId(existing.personioPeriodId)) {
+          await patchAttendanceEnd(env, redis, existing.personioPeriodId, closeBerlin);
+        } else {
+          await recordAnomaly(redis, {
+            type: "SHADOW_SESSION_DROPPED_ON_DOUBLE_IN",
+            email,
+            eventId,
+            details: { prevStart: existing.startBerlinISO }
+          });
+        }
       } else {
-        log("info", "personio.shadow_skip_patch_end", { email, periodId: existing.personioPeriodId, end: closeBerlin });
+        log("info", "personio.shadow_skip_patch_end", {
+          email,
+          periodId: existing.personioPeriodId,
+          end: closeBerlin
+        });
       }
 
       await pushHistory(redis, {
@@ -143,7 +160,9 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
     return;
   }
 
-  // Out
+  // =========================
+  // OUT
+  // =========================
   const open = await getOpenSession(redis, email);
   if (!open) {
     await recordAnomaly(redis, { type: "OUT_WITHOUT_IN", email, eventId, details: { out: stampBerlinISO } });
@@ -151,17 +170,58 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
     return;
   }
 
-  // Enforce Personio constraint: attendance cannot span two days → if OUT next day, split
+  // If the open session was created while SHADOW_MODE=true earlier, it has "shadow-period".
+  // Recover by creating a new attendance in Personio and closing it immediately.
+  if (!env.SHADOW_MODE && isShadowPeriodId(open.personioPeriodId)) {
+    await recordAnomaly(redis, {
+      type: "SHADOW_PERIOD_RECOVER",
+      email,
+      eventId,
+      details: { start: open.startBerlinISO, out: stampBerlinISO }
+    });
+
+    const employeeId = await getEmployeeIdByEmail(env, redis, email);
+    if (!employeeId) {
+      await recordAnomaly(redis, { type: "PERSONIO_EMPLOYEE_NOT_FOUND", email, eventId });
+      await clearOpenSession(redis, email);
+      return;
+    }
+
+    const newId = await createAttendanceOpenEnded(env, redis, employeeId, open.startBerlinISO);
+    await patchAttendanceEnd(env, redis, newId, stampBerlinISO);
+
+    await pushHistory(redis, {
+      email,
+      start: open.startBerlinISO,
+      end: stampBerlinISO,
+      reason: "RECOVER_FROM_SHADOW",
+      periodId: newId
+    });
+
+    await clearOpenSession(redis, email);
+
+    log("info", "attendance.out.closed_recovered", {
+      email,
+      start: open.startBerlinISO,
+      end: stampBerlinISO,
+      periodId: newId
+    });
+
+    return;
+  }
+
+  // Enforce: if OUT next day, split
   const startDay = open.startBerlinISO.slice(0, 10);
   const outDay = stampBerlinISO.slice(0, 10);
 
   if (outDay !== startDay) {
-    // Close first day at min(autoClose, dayEnd)
     const firstEndUtc = Math.min(open.autoCloseAtUtcMs, berlinDayEndUtcMillis(open.startUtcMs));
     const firstEndBerlin = toBerlinISO(firstEndUtc);
 
     if (!env.SHADOW_MODE) {
-      await patchAttendanceEnd(env, redis, open.personioPeriodId, firstEndBerlin);
+      if (!isShadowPeriodId(open.personioPeriodId)) {
+        await patchAttendanceEnd(env, redis, open.personioPeriodId, firstEndBerlin);
+      }
     } else {
       log("info", "personio.shadow_skip_patch_end", { email, periodId: open.personioPeriodId, end: firstEndBerlin });
     }
@@ -185,12 +245,11 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
 
     log("warn", "attendance.out.next_day_split", { email, start: open.startBerlinISO, out: stampBerlinISO });
 
-    // Optional: create day2 attendance from 00:00 to out (best-effort)
-    // If you *never* want this, delete the block below.
+    // Optional: create day2 attendance from 00:00 to out
     const employeeId = await getEmployeeIdByEmail(env, redis, email);
     if (!employeeId) return;
 
-    const midnightBerlin = `${outDay}T00:00:00+01:00`; // ok for Berlin in winter; Luxon not used here by design
+    const midnightBerlin = `${outDay}T00:00:00+01:00`;
     if (!env.SHADOW_MODE) {
       const newId = await createAttendanceOpenEnded(env, redis, employeeId, midnightBerlin);
       await patchAttendanceEnd(env, redis, newId, stampBerlinISO);
@@ -202,11 +261,21 @@ export async function handleAttendance(env: Env, redis: Redis, body: any): Promi
     return;
   }
 
-  // Normal same-day OUT: patch end (even if already auto-closed earlier, overwrite is ok)
+  // Normal same-day OUT
   const endBerlin = stampBerlinISO;
 
   if (!env.SHADOW_MODE) {
-    await patchAttendanceEnd(env, redis, open.personioPeriodId, endBerlin);
+    if (isShadowPeriodId(open.personioPeriodId)) {
+      // If we somehow got here with shadow id, just drop to avoid 400s
+      await recordAnomaly(redis, {
+        type: "SHADOW_PERIOD_CANNOT_PATCH",
+        email,
+        eventId,
+        details: { periodId: open.personioPeriodId, end: endBerlin }
+      });
+    } else {
+      await patchAttendanceEnd(env, redis, open.personioPeriodId, endBerlin);
+    }
   } else {
     log("info", "personio.shadow_skip_patch_end", { email, periodId: open.personioPeriodId, end: endBerlin });
   }
