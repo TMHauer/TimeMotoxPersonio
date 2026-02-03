@@ -26,17 +26,17 @@ export async function getPersonioToken(env: Env, redis: Redis): Promise<string> 
     if (Number.isFinite(exp) && exp - now > 60_000) return tok; // 60s buffer
   }
 
-  // Robust: use x-www-form-urlencoded to avoid 415 Unsupported Media Type :contentReference[oaicite:1]{index=1}
+  // Use x-www-form-urlencoded
   const body = formEncode({
     client_id: env.PERSONIO_CLIENT_ID,
     client_secret: env.PERSONIO_CLIENT_SECRET,
     grant_type: "client_credentials"
   });
 
+  // IMPORTANT: For Personio v2, DO NOT set Accept: application/json (your logs show it can be rejected).
   const r = await personioFetch(env, "/v2/auth/token", {
     method: "POST",
     headers: {
-      "accept": "application/json",
       "content-type": "application/x-www-form-urlencoded"
     },
     body
@@ -51,7 +51,9 @@ export async function getPersonioToken(env: Env, redis: Redis): Promise<string> 
   const access = json?.access_token;
   const expiresIn = Number(json?.expires_in ?? 3600);
 
-  if (typeof access !== "string" || !access) throw new Error(`Personio token response missing access_token: ${txt}`);
+  if (typeof access !== "string" || !access) {
+    throw new Error(`Personio token response missing access_token: ${txt}`);
+  }
 
   const exp = Date.now() + Math.max(300, expiresIn - 60) * 1000;
   await redis.set(tokenKey, access, { EX: Math.max(300, expiresIn - 60) });
@@ -67,7 +69,7 @@ export async function getEmployeeIdByEmail(env: Env, redis: Redis, email: string
 
   const token = await getPersonioToken(env, redis);
 
-  // Employee API email filter exists on v1/company/employees :contentReference[oaicite:2]{index=2}
+  // v1 employee lookup is OK with accept: application/json
   const url = `${env.PERSONIO_BASE_URL}/v1/company/employees?limit=1&offset=0&email=${encodeURIComponent(email)}`;
   const r = await fetch(url, {
     method: "GET",
@@ -79,14 +81,13 @@ export async function getEmployeeIdByEmail(env: Env, redis: Redis, email: string
 
   const txt = await r.text();
   if (!r.ok) {
-    log("warn", "personio.employee_lookup_failed", { email, status: r.status });
+    log("warn", "personio.employee_lookup_failed", { email, status: r.status, body: txt.slice(0, 200) });
     return null;
   }
 
   const json = JSON.parse(txt) as any;
   const first = json?.data?.[0];
 
-  // try multiple shapes
   const idVal =
     first?.attributes?.id?.value ??
     first?.id?.value ??
@@ -100,17 +101,21 @@ export async function getEmployeeIdByEmail(env: Env, redis: Redis, email: string
   return id;
 }
 
-export async function createAttendanceOpenEnded(env: Env, redis: Redis, employeeId: string, startLocalBerlin: string): Promise<string> {
+export async function createAttendanceOpenEnded(
+  env: Env,
+  redis: Redis,
+  employeeId: string,
+  startLocalBerlin: string
+): Promise<string> {
   const token = await getPersonioToken(env, redis);
 
   const headers: Record<string, string> = {
-    "accept": "application/json",
+    // IMPORTANT: no Accept header here (Personio v2 can reject application/json)
     "content-type": "application/json",
     "authorization": `Bearer ${token}`
   };
   if (env.PERSONIO_BETA_HEADER) headers["Beta"] = "true";
 
-  // v2 attendance-periods accepts open-ended end (or missing) :contentReference[oaicite:3]{index=3}
   const payload = {
     person: { id: employeeId },
     type: "WORK",
@@ -128,7 +133,6 @@ export async function createAttendanceOpenEnded(env: Env, redis: Redis, employee
   const txt = await r.text();
   if (!r.ok) throw new Error(`Personio create attendance failed ${r.status}: ${txt}`);
 
-  // Try to extract id robustly
   const json = JSON.parse(txt) as any;
   const id = json?.data?.id ?? json?.id ?? json?.data?.attributes?.id;
   if (!id) throw new Error(`Personio create returned no id: ${txt}`);
@@ -139,7 +143,7 @@ export async function patchAttendanceEnd(env: Env, redis: Redis, periodId: strin
   const token = await getPersonioToken(env, redis);
 
   const headers: Record<string, string> = {
-    "accept": "application/json",
+    // IMPORTANT: no Accept header here (Personio v2 can reject application/json)
     "content-type": "application/json",
     "authorization": `Bearer ${token}`
   };
@@ -157,6 +161,6 @@ export async function patchAttendanceEnd(env: Env, redis: Redis, periodId: strin
   });
 
   const txt = await r.text();
-  // PATCH often returns 204 with empty body (ok)
+  // PATCH may return 204 with empty body (OK)
   if (!r.ok) throw new Error(`Personio patch end failed ${r.status}: ${txt}`);
 }
