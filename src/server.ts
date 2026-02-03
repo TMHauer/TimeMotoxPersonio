@@ -12,15 +12,18 @@ const redis = createRedis(env);
 
 const app = express();
 
-app.get("/health", (_req, res) => {
+app.get("/health", (_req: Request, res: Response) => {
   res.json({ ok: true, ts: new Date().toISOString(), shadow: env.SHADOW_MODE });
 });
 
-// IMPORTANT: raw body needed for signature validation
-app.post("/webhook/timemoto", express.raw({ type: "application/json" }), async (req, res) => {
+app.post("/webhook/timemoto", express.raw({ type: "application/json" }), async (req: Request, res: Response) => {
   const raw = req.body as Buffer;
-  const sig = req.header("timemoto-signature");
+  ...
+});
 
+app.get("/admin/anomalies", async (req: Request, res: Response) => {
+  ...
+});
   if (!verifyTimemotoSignature(raw, sig, env.TIMEMOTO_WEBHOOK_SECRET)) {
     log("warn", "webhook.signature_invalid");
     return res.status(401).json({ ok: false, code: "SIGNATURE_INVALID" });
