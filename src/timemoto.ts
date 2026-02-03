@@ -62,31 +62,17 @@ function base64ToBuf(s: string): Buffer | null {
   }
 }
 
-function signatureCandidates(headerSig: string): string[] {
-  const trimmed = (headerSig ?? "").trim();
-  if (!trimmed) return [];
-
-  const out = new Set<string>();
-  out.add(trimmed);
-
-  const normalized = trimmed.replace(/^sha256=/i, "").replace(/^hmac-sha256=/i, "");
-  out.add(normalized);
-
-  for (const token of trimmed.split(/,\s*/)) {
-    if (!token) continue;
-    out.add(token);
-    const idx = token.indexOf("=");
-    if (idx !== -1 && idx + 1 < token.length) {
-      out.add(token.slice(idx + 1));
-    }
-  }
-
-  return [...out].map((v) => v.trim()).filter(Boolean);
+function stripSigPrefix(sig: string): string {
+  // allow common formats like "sha256=...."
+  return String(sig ?? "")
+    .trim()
+    .replace(/^sha256=/i, "")
+    .trim();
 }
 
 export function verifyTimemotoSignature(rawBody: Buffer, headerSig: string, secret: string): boolean {
-  const sigs = signatureCandidates(headerSig);
-  if (sigs.length === 0) return false;
+  const sig = stripSigPrefix(headerSig);
+  if (!sig) return false;
 
   const candidates: Buffer[] = [];
 
@@ -108,23 +94,29 @@ export function verifyTimemotoSignature(rawBody: Buffer, headerSig: string, secr
     }
   }
 
-  // compare against hex signature (most common: 64 hex chars)
+  // Compare against different signature schemes that vendors sometimes use:
   for (const key of candidates) {
-    const h = crypto.createHmac("sha256", key).update(rawBody).digest("hex");
-    for (const sig of sigs) {
-      if (timingSafeEq(h.toLowerCase(), sig.toLowerCase())) return true;
-    }
+    // A) HMAC-SHA256 -> hex
+    const hHex = crypto.createHmac("sha256", key).update(rawBody).digest("hex");
+    if (timingSafeEq(hHex.toLowerCase(), sig.toLowerCase())) return true;
 
-    // sometimes sent as base64
-    const b64 = crypto.createHmac("sha256", key).update(rawBody).digest("base64");
-    for (const sig of sigs) {
-      if (timingSafeEq(b64, sig)) return true;
-    }
+    // B) HMAC-SHA256 -> base64
+    const hB64 = crypto.createHmac("sha256", key).update(rawBody).digest("base64");
+    if (timingSafeEq(hB64, sig)) return true;
 
-    const b64url = b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
-    for (const sig of sigs) {
-      if (timingSafeEq(b64url, sig)) return true;
-    }
+    // C) HMAC-SHA256 -> base64url
+    const hB64Url = hB64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+    if (timingSafeEq(hB64Url, sig)) return true;
+
+    // D) Some vendors use sha256(secret + body) (NOT HMAC) -> hex
+    const sPlusBody = Buffer.concat([key, rawBody]);
+    const sha1 = crypto.createHash("sha256").update(sPlusBody).digest("hex");
+    if (timingSafeEq(sha1.toLowerCase(), sig.toLowerCase())) return true;
+
+    // E) Some vendors use sha256(body + secret) (NOT HMAC) -> hex
+    const bodyPlusS = Buffer.concat([rawBody, key]);
+    const sha2 = crypto.createHash("sha256").update(bodyPlusS).digest("hex");
+    if (timingSafeEq(sha2.toLowerCase(), sig.toLowerCase())) return true;
   }
 
   return false;
