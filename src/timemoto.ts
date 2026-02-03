@@ -8,25 +8,6 @@ export function normalizeEmail(s: any): string | null {
   return e.includes("@") ? e : null;
 }
 
-function timingSafeEqualHex(a: string, b: string): boolean {
-  const aa = a.toLowerCase();
-  const bb = b.toLowerCase();
-  if (aa.length !== bb.length) return false;
-  let out = 0;
-  for (let i = 0; i < aa.length; i++) out |= aa.charCodeAt(i) ^ bb.charCodeAt(i);
-  return out === 0;
-}
-
-export function verifyTimemotoSignature(
-  rawBody: Buffer,
-  signatureHeader: string | undefined | null,
-  secret: string
-): boolean {
-  if (!signatureHeader) return false;
-  const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-  return timingSafeEqualHex(expected, signatureHeader);
-}
-
 // Prefer timeInserted (UTC Z). Fallback to timeLogged (assume Berlin local)
 export function extractStampUtc(ev: any): Date {
   const ti = ev?.data?.timeInserted;
@@ -37,7 +18,6 @@ export function extractStampUtc(ev: any): Date {
 
   const tl = ev?.data?.timeLogged;
   if (typeof tl === "string") {
-    // timeLogged e.g. "2026-02-02T17:06:00" in Europe/Berlin
     const m = tl.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})/);
     if (m) {
       const y = Number(m[1]), mo = Number(m[2]), da = Number(m[3]);
@@ -61,9 +41,7 @@ export function toBerlinISO(dateUtc: Date): string {
 }
 
 export function berlinDayEndUtcMillis(startUtc: Date): number {
-  // get Berlin local date of the start
   const p = partsInTimeZone(startUtc, TZ);
-  // 23:59:00 local
   const endUtc = zonedLocalToUtcDate(Number(p.y), Number(p.mo), Number(p.d), 23, 59, 0, TZ);
   return endUtc.getTime();
 }
@@ -81,7 +59,7 @@ function partsInTimeZone(date: Date, timeZone: string) {
   });
 
   const parts = dtf.formatToParts(date);
-  const get = (t: string) => parts.find(p => p.type === t)?.value ?? "00";
+  const get = (t: string) => parts.find((p) => p.type === t)?.value ?? "00";
   return {
     y: get("year"),
     mo: get("month"),
@@ -102,7 +80,6 @@ function getOffsetMinutes(date: Date, timeZone: string): number {
     Number(p.mi),
     Number(p.s)
   );
-  // if local time is ahead of UTC, offset is positive
   return Math.round((asUtc - date.getTime()) / 60000);
 }
 
@@ -115,10 +92,8 @@ function zonedLocalToUtcDate(
   second: number,
   timeZone: string
 ): Date {
-  // initial guess: treat local as UTC
   let utcMillis = Date.UTC(year, month - 1, day, hour, minute, second);
 
-  // refine 2x for DST correctness
   for (let i = 0; i < 2; i++) {
     const guessDate = new Date(utcMillis);
     const offset = getOffsetMinutes(guessDate, timeZone);
@@ -126,4 +101,69 @@ function zonedLocalToUtcDate(
   }
 
   return new Date(utcMillis);
+}
+
+/**
+ * TimeMoto signature verification (robust):
+ * - supports hex or base64 digest
+ * - supports headers like: "sha256=<sig>", "t=...,v1=<sig>", "<sig>"
+ */
+export function verifyTimemotoSignature(
+  rawBody: Buffer,
+  signatureHeader: string | undefined | null,
+  secret: string
+): boolean {
+  if (!signatureHeader) return false;
+
+  const provided = extractSignatureToken(signatureHeader);
+  if (!provided) return false;
+
+  const h = crypto.createHmac("sha256", secret).update(rawBody);
+  const expectedHex = h.digest("hex");
+
+  const h2 = crypto.createHmac("sha256", secret).update(rawBody);
+  const expectedB64 = h2.digest("base64");
+
+  return safeEqual(provided, expectedHex) || safeEqual(provided, expectedB64);
+}
+
+function extractSignatureToken(headerValue: string): string | null {
+  const v = headerValue.trim();
+
+  // Common patterns:
+  // - "sha256=<sig>"
+  // - "t=123,v1=<sig>"
+  // - "v1=<sig>"
+  // - plain "<sig>"
+  const m1 = v.match(/sha256=([A-Za-z0-9+/=._-]+)/i);
+  if (m1?.[1]) return m1[1];
+
+  const m2 = v.match(/v1=([A-Za-z0-9+/=._-]+)/i);
+  if (m2?.[1]) return m2[1];
+
+  const m3 = v.match(/signature=([A-Za-z0-9+/=._-]+)/i);
+  if (m3?.[1]) return m3[1];
+
+  // if comma-separated, try last token
+  if (v.includes(",")) {
+    const parts = v.split(",").map((s) => s.trim());
+    for (let i = parts.length - 1; i >= 0; i--) {
+      const p = parts[i];
+      const mm = p.match(/(?:sha256|v1|sig|signature)=([A-Za-z0-9+/=._-]+)/i);
+      if (mm?.[1]) return mm[1];
+    }
+  }
+
+  // fallback: raw token
+  return v.length > 10 ? v : null;
+}
+
+function safeEqual(a: string, b: string): boolean {
+  const aa = a.trim();
+  const bb = b.trim();
+  if (aa.length !== bb.length) return false;
+
+  const ba = Buffer.from(aa);
+  const bb2 = Buffer.from(bb);
+  return crypto.timingSafeEqual(ba, bb2);
 }
