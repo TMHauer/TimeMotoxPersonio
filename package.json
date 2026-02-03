@@ -1,0 +1,19 @@
+{
+  "name": "timemoto-personio-middleware",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "cron": "node dist/cron.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@upstash/redis": "^1.35.0",
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.3"
+  }
+}
