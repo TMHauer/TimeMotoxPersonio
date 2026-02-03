@@ -1,10 +1,12 @@
-export function log(level: "info" | "warn" | "error", msg: string, meta?: Record<string, unknown>) {
-  const entry = {
+export type LogLevel = "info" | "warn" | "error";
+
+export function log(level: LogLevel, event: string, data: Record<string, any> = {}) {
+  const line = {
     ts: new Date().toISOString(),
     level,
-    msg,
-    ...(meta ? { meta } : {})
+    event,
+    ...data
   };
-  // minimal logging: no raw payloads
-  console.log(JSON.stringify(entry));
+  // Render picks up stdout
+  console.log(JSON.stringify(line));
 }
