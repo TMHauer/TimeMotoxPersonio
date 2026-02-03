@@ -1,41 +1,53 @@
+import type { Redis } from "./redis";
+
 export type OpenSession = {
   email: string;
-  startAtUtcMs: number;
+
+  startUtcMs: number;
   startBerlinISO: string;
+
+  // min(start+12h, dayEnd(23:59 Berlin))
   autoCloseAtUtcMs: number;
-  autoCloseAtBerlinISO: string;
+
+  // Personio attendance period id (we create on IN as open-ended)
   personioPeriodId: string;
+
   openedEventId: string;
+
+  updatedAt: string;
 };
 
-type RedisLike = {
-  get(key: string): Promise<any>;
-  set(key: string, value: any, ...args: any[]): Promise<any>;
-  del(key: string): Promise<any>;
-};
+const OPEN_PREFIX = "session:open:";     // session:open:<email>
+const AUTOCLOSE_ZSET = "session:autoclose"; // score=autoCloseAtUtcMs, member=email
+const HISTORY_LIST = "session:history";  // global list of json lines
 
-const KEY_OPEN = (email: string) => `session:open:${email}`;
-
-// Canonical function names
-export async function getOpenSession(redis: RedisLike, email: string): Promise<OpenSession | null> {
-  const raw = await redis.get(KEY_OPEN(email));
+export async function getOpenSession(redis: Redis, email: string): Promise<OpenSession | null> {
+  const raw = await redis.get(OPEN_PREFIX + email);
   if (!raw) return null;
   try {
-    return typeof raw === "string" ? (JSON.parse(raw) as OpenSession) : (raw as OpenSession);
+    return JSON.parse(raw) as OpenSession;
   } catch {
     return null;
   }
 }
 
-export async function setOpenSession(redis: RedisLike, session: OpenSession): Promise<void> {
-  await redis.set(KEY_OPEN(session.email), JSON.stringify(session));
+export async function setOpenSession(redis: Redis, s: OpenSession): Promise<void> {
+  await redis.set(OPEN_PREFIX + s.email, JSON.stringify(s));
+  await redis.zAdd(AUTOCLOSE_ZSET, [{ score: s.autoCloseAtUtcMs, value: s.email }]);
 }
 
-export async function clearOpenSession(redis: RedisLike, email: string): Promise<void> {
-  await redis.del(KEY_OPEN(email));
+export async function clearOpenSession(redis: Redis, email: string): Promise<void> {
+  await redis.del(OPEN_PREFIX + email);
+  await redis.zRem(AUTOCLOSE_ZSET, email);
 }
 
-// Also export the "short" aliases (in case other files already use them)
-export const getOpen = getOpenSession;
-export const setOpen = setOpenSession;
-export const clearOpen = clearOpenSession;
+export async function listDueAutoClose(redis: Redis, nowUtcMs: number, limit: number): Promise<string[]> {
+  const res = await redis.zRangeByScore(AUTOCLOSE_ZSET, 0, nowUtcMs, { LIMIT: { offset: 0, count: limit } });
+  return res ?? [];
+}
+
+export async function pushHistory(redis: Redis, item: Record<string, unknown>): Promise<void> {
+  const line = { ts: new Date().toISOString(), ...item };
+  await redis.lPush(HISTORY_LIST, JSON.stringify(line));
+  await redis.lTrim(HISTORY_LIST, 0, 1999);
+}
