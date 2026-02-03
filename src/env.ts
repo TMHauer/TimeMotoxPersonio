@@ -2,6 +2,8 @@ export type Env = {
   PORT: number;
 
   REDIS_URL: string;
+  UPSTASH_REDIS_REST_URL?: string;
+  UPSTASH_REDIS_REST_TOKEN?: string;
 
   // TimeMoto
   TIMEMOTO_WEBHOOK_SECRET: string;
@@ -32,11 +34,38 @@ function bool(name: string, def: boolean): boolean {
   return ["1", "true", "yes", "on"].includes(v.toLowerCase());
 }
 
+function optional(name: string): string | undefined {
+  const v = process.env[name];
+  if (!v) return undefined;
+  const trimmed = v.trim();
+  return trimmed.length > 0 ? trimmed : undefined;
+}
+
+function redisUrlFromUpstash(restUrl: string, token: string): string {
+  const parsed = new URL(restUrl);
+  const host = parsed.hostname;
+  const port = parsed.port || "6379";
+  return `rediss://default:${token}@${host}:${port}`;
+}
+
 export function loadEnv(): Env {
+  const upstashRestUrl = optional("UPSTASH_REDIS_REST_URL");
+  const upstashRestToken = optional("UPSTASH_REDIS_REST_TOKEN");
+  const redisUrl =
+    optional("REDIS_URL") ??
+    (upstashRestUrl && upstashRestToken
+      ? redisUrlFromUpstash(upstashRestUrl, upstashRestToken)
+      : undefined);
+  if (!redisUrl) {
+    throw new Error("Missing env var: REDIS_URL");
+  }
+
   return {
     PORT: Number(process.env.PORT ?? "10000"),
 
-    REDIS_URL: must("REDIS_URL"),
+    REDIS_URL: redisUrl,
+    UPSTASH_REDIS_REST_URL: upstashRestUrl,
+    UPSTASH_REDIS_REST_TOKEN: upstashRestToken,
 
     TIMEMOTO_WEBHOOK_SECRET: must("TIMEMOTO_WEBHOOK_SECRET"),
     ALLOW_INVALID_SIGNATURE: bool("ALLOW_INVALID_SIGNATURE", false),
