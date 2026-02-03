@@ -1,61 +1,41 @@
-import type { RedisClient } from "./redis";
-import { toBerlinLocalNoOffset, berlinDayEndUtcMillis } from "./timemoto";
-
 export type OpenSession = {
   email: string;
-  startUtc: number;
-  startBerlin: string;
-  autoCloseAtUtc: number;
-  autoCloseAtBerlin: string;
-  periodId: string;
+  startAtUtcMs: number;
+  startBerlinISO: string;
+  autoCloseAtUtcMs: number;
+  autoCloseAtBerlinISO: string;
+  personioPeriodId: string;
   openedEventId: string;
 };
 
-const OPEN_PREFIX = "open:";
-const AUTOCLOSE_ZSET = "session:autoclose";
-const HISTORY_PREFIX = "history:"; // history:<email> list
+type RedisLike = {
+  get(key: string): Promise<any>;
+  set(key: string, value: any, ...args: any[]): Promise<any>;
+  del(key: string): Promise<any>;
+};
 
-export async function getOpen(redis: RedisClient, email: string): Promise<OpenSession | null> {
-  const key = OPEN_PREFIX + email;
-  const v = await redis.get(key);
-  if (!v) return null;
+const KEY_OPEN = (email: string) => `session:open:${email}`;
+
+// Canonical function names
+export async function getOpenSession(redis: RedisLike, email: string): Promise<OpenSession | null> {
+  const raw = await redis.get(KEY_OPEN(email));
+  if (!raw) return null;
   try {
-    return JSON.parse(v) as OpenSession;
+    return typeof raw === "string" ? (JSON.parse(raw) as OpenSession) : (raw as OpenSession);
   } catch {
     return null;
   }
 }
 
-export async function setOpen(redis: RedisClient, s: OpenSession): Promise<void> {
-  const key = OPEN_PREFIX + s.email;
-  await redis.set(key, JSON.stringify(s));
-  await redis.zadd(AUTOCLOSE_ZSET, s.autoCloseAtUtc, s.email);
+export async function setOpenSession(redis: RedisLike, session: OpenSession): Promise<void> {
+  await redis.set(KEY_OPEN(session.email), JSON.stringify(session));
 }
 
-export async function clearOpen(redis: RedisClient, email: string): Promise<void> {
-  await redis.del(OPEN_PREFIX + email);
-  await redis.zrem(AUTOCLOSE_ZSET, email);
+export async function clearOpenSession(redis: RedisLike, email: string): Promise<void> {
+  await redis.del(KEY_OPEN(email));
 }
 
-export async function pushHistory(redis: RedisClient, email: string, item: Record<string, unknown>): Promise<void> {
-  const key = HISTORY_PREFIX + email;
-  await redis.lpush(key, JSON.stringify(item));
-  await redis.ltrim(key, 0, 49);
-}
-
-export async function getRecentHistory(redis: RedisClient, email: string, limit: number): Promise<any[]> {
-  const key = HISTORY_PREFIX + email;
-  const raws = await redis.lrange(key, 0, Math.max(0, limit - 1));
-  return raws
-    .map((s) => {
-      try { return JSON.parse(s); } catch { return null; }
-    })
-    .filter(Boolean);
-}
-
-export function computeAutoClose(startUtc: number): { autoCloseAtUtc: number; autoCloseAtBerlin: string } {
-  const max12h = startUtc + 12 * 3600_000;
-  const dayEnd = berlinDayEndUtcMillis(startUtc);
-  const autoCloseAtUtc = Math.min(max12h, dayEnd);
-  return { autoCloseAtUtc, autoCloseAtBerlin: toBerlinLocalNoOffset(autoCloseAtUtc) };
-}
+// Also export the "short" aliases (in case other files already use them)
+export const getOpen = getOpenSession;
+export const setOpen = setOpenSession;
+export const clearOpen = clearOpenSession;
