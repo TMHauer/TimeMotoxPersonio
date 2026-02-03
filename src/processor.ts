@@ -1,15 +1,15 @@
-import type { Env } from "./env";
+import type { Env } from "./env.js";
 import type { Redis } from "@upstash/redis";
-import { log } from "./log";
-import { pushAnomaly } from "./anomalies";
-import { normalizeEmail, extractStampUtc, utcToBerlinLocalIso, berlinDayEnd } from "./timemoto";
-import { getEmployeeIdByEmail, createAttendance, patchAttendanceEnd } from "./personio";
-import { getOpenSession, setOpenSession, clearOpenSession, computeAutoClose } from "./session";
+import { log } from "./log.js";
+import { pushAnomaly } from "./anomalies.js";
+import { normalizeEmail, extractStampUtc, toBerlinISO, berlinDayEndUtcMillis } from "./timemoto.js";
+import { getEmployeeIdByEmail, createAttendance, patchAttendanceEnd } from "./personio.js";
+import { getOpenSession, setOpenSession, clearOpenSession, computeAutoCloseUtcMillis, upsertAutoCloseIndex } from "./session.js";
 
-const IDEMP_PREFIX = "idemp:event:"; // idemp:event:<eventId> = 1 (ttl)
-const IDEMP_TTL_SECONDS = 60 * 60 * 24 * 14; // 14 days
+const IDEMP_PREFIX = "idemp:event:";
+const IDEMP_TTL_SECONDS = 60 * 60 * 24 * 14;
 
-export async function acquireIdempotency(redis: Redis, eventId: string): Promise<boolean> {
+async function acquireIdempotency(redis: Redis, eventId: string): Promise<boolean> {
   const key = `${IDEMP_PREFIX}${eventId}`;
   const ok = await redis.set(key, "1", { nx: true, ex: IDEMP_TTL_SECONDS });
   return ok === "OK";
@@ -42,22 +42,22 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
     return;
   }
 
-  const stampUtc = extractStampUtc(ev as any);
-  const stampBerlin = utcToBerlinLocalIso(stampUtc);
-
-  // idempotency
   const first = await acquireIdempotency(redis, ev.id);
   if (!first) {
     log("info", "attendance.duplicate", { eventId: ev.id, email });
     return;
   }
 
+  const stampUtc = extractStampUtc(ev as any);
+  const stampBerlin = toBerlinISO(stampUtc);
+
   const open = await getOpenSession(redis, email);
 
   if (ev.data.clockingType === "In") {
     if (open) {
-      // DOUBLE-IN => close previous at min(newIn, autoClose)
-      const endBerlin = open.autoCloseBerlin < stampBerlin ? open.autoCloseBerlin : stampBerlin;
+      // DOUBLE-IN: close previous session at min(newIn, autoClose)
+      const endUtcMillis = Math.min(stampUtc.getTime(), open.autoCloseUtcMillis);
+      const endBerlin = toBerlinISO(new Date(endUtcMillis));
 
       await pushAnomaly(redis, {
         ts: new Date().toISOString(),
@@ -74,10 +74,13 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
     const employeeId = await getEmployeeIdByEmail(env, redis, email);
     const periodId = env.SHADOW_MODE ? `shadow_${Date.now()}` : await createAttendance(env, redis, employeeId, stampBerlin);
 
-    const autoCloseBerlin = computeAutoClose(stampBerlin);
+    const autoCloseUtcMillis = computeAutoCloseUtcMillis(stampUtc);
+    const autoCloseBerlin = toBerlinISO(new Date(autoCloseUtcMillis));
 
     await setOpenSession(redis, {
       email,
+      startUtcMillis: stampUtc.getTime(),
+      autoCloseUtcMillis,
       startBerlin: stampBerlin,
       autoCloseBerlin,
       personioPeriodId: periodId,
@@ -85,7 +88,14 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
       updatedAt: new Date().toISOString()
     });
 
-    log("info", "attendance.in.processed", { email, startBerlin: stampBerlin, autoCloseBerlin, shadow: env.SHADOW_MODE });
+    await upsertAutoCloseIndex(redis, email, Math.floor(autoCloseUtcMillis / 1000));
+
+    log("info", "attendance.in.processed", {
+      email,
+      startBerlin: stampBerlin,
+      autoCloseBerlin,
+      shadow: env.SHADOW_MODE
+    });
     return;
   }
 
@@ -98,29 +108,4 @@ export async function handleAttendance(env: Env, redis: Redis, ev: TimemotoAtten
       eventId: ev.id,
       details: { out: stampBerlin }
     });
-    log("warn", "attendance.out.without_in", { email, out: stampBerlin });
-    return;
-  }
-
-  // guard
-  if (stampBerlin < open.startBerlin) {
-    await pushAnomaly(redis, {
-      ts: new Date().toISOString(),
-      type: "OUT_BEFORE_IN",
-      email,
-      eventId: ev.id,
-      details: { start: open.startBerlin, out: stampBerlin }
-    });
-    log("warn", "attendance.out.before_in", { email });
-    return;
-  }
-
-  // clamp to 23:59 of start day
-  const dayEnd = berlinDayEnd(open.startBerlin);
-  const endBerlin = stampBerlin > dayEnd ? dayEnd : stampBerlin;
-
-  if (!env.SHADOW_MODE) await patchAttendanceEnd(env, redis, open.personioPeriodId, endBerlin);
-  await clearOpenSession(redis, email);
-
-  log("info", "attendance.out.processed", { email, endBerlin, shadow: env.SHADOW_MODE });
-}
+    log("warn", "attendance.ou
