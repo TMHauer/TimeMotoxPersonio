@@ -1,43 +1,38 @@
 import type { Env } from "./env";
+import type { Redis } from "./redis";
 import { log } from "./log";
-import type { RedisClient } from "./redis";
 
-type TokenCache = { access_token: string; expires_at: number };
-
-const TOKEN_KEY = "personio:token";
-const EMP_CACHE_PREFIX = "personio:emp:"; // personio:emp:<email>
-
-async function httpJson(url: string, init: RequestInit): Promise<{ status: number; json: any; text: string }> {
-  const res = await fetch(url, init);
-  const text = await res.text();
-  let json: any = null;
-  try {
-    json = text ? JSON.parse(text) : null;
-  } catch {
-    json = null;
-  }
-  return { status: res.status, json, text };
+function formEncode(obj: Record<string, string>): string {
+  return Object.entries(obj)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+    .join("&");
 }
 
-export async function getPersonioToken(env: Env, redis: RedisClient): Promise<string> {
-  const cached = await redis.get(TOKEN_KEY);
-  if (cached) {
-    try {
-      const t = JSON.parse(cached) as TokenCache;
-      if (t.access_token && t.expires_at > Date.now() + 30_000) return t.access_token;
-    } catch {
-      // ignore
-    }
+async function personioFetch(env: Env, path: string, init: RequestInit): Promise<Response> {
+  const url = `${env.PERSONIO_BASE_URL}${path}`;
+  return fetch(url, init);
+}
+
+export async function getPersonioToken(env: Env, redis: Redis): Promise<string> {
+  const tokenKey = "personio:token";
+  const expKey = "personio:token:exp";
+
+  const expRaw = await redis.get(expKey);
+  const tok = await redis.get(tokenKey);
+
+  const now = Date.now();
+  if (tok && expRaw) {
+    const exp = Number(expRaw);
+    if (Number.isFinite(exp) && exp - now > 60_000) return tok; // 60s buffer
   }
 
-  // Personio requires x-www-form-urlencoded for client_credentials grant :contentReference[oaicite:10]{index=10}
-  const body = new URLSearchParams();
-  body.set("grant_type", "client_credentials");
-  body.set("client_id", env.PERSONIO_CLIENT_ID);
-  body.set("client_secret", env.PERSONIO_CLIENT_SECRET);
+  // Robust: use x-www-form-urlencoded to avoid 415 Unsupported Media Type :contentReference[oaicite:1]{index=1}
+  const body = formEncode({
+    client_id: env.PERSONIO_CLIENT_ID,
+    client_secret: env.PERSONIO_CLIENT_SECRET
+  });
 
-  const url = `${env.PERSONIO_BASE_URL}/v2/auth/token`;
-  const { status, json, text } = await httpJson(url, {
+  const r = await personioFetch(env, "/v2/auth/token", {
     method: "POST",
     headers: {
       "accept": "application/json",
@@ -46,29 +41,34 @@ export async function getPersonioToken(env: Env, redis: RedisClient): Promise<st
     body
   });
 
-  if (status >= 300) {
-    throw new Error(`Personio token failed ${status}: ${text}`);
+  const txt = await r.text();
+  if (!r.ok) {
+    throw new Error(`Personio token failed ${r.status}: ${txt}`);
   }
 
-  const access = String(json?.access_token ?? "");
+  const json = JSON.parse(txt) as any;
+  const access = json?.access_token;
   const expiresIn = Number(json?.expires_in ?? 3600);
-  if (!access) throw new Error(`Personio token missing: ${text}`);
 
-  const cache: TokenCache = { access_token: access, expires_at: Date.now() + expiresIn * 1000 };
-  await redis.set(TOKEN_KEY, JSON.stringify(cache), "PX", Math.max(60_000, expiresIn * 1000));
+  if (typeof access !== "string" || !access) throw new Error(`Personio token response missing access_token: ${txt}`);
+
+  const exp = Date.now() + Math.max(300, expiresIn - 60) * 1000;
+  await redis.set(tokenKey, access, { EX: Math.max(300, expiresIn - 60) });
+  await redis.set(expKey, String(exp), { EX: Math.max(300, expiresIn - 60) });
+
   return access;
 }
 
-export async function getEmployeeIdByEmail(env: Env, redis: RedisClient, email: string): Promise<string | null> {
-  const key = EMP_CACHE_PREFIX + email;
-  const cached = await redis.get(key);
+export async function getEmployeeIdByEmail(env: Env, redis: Redis, email: string): Promise<string | null> {
+  const cacheKey = `personio:emp:${email}`;
+  const cached = await redis.get(cacheKey);
   if (cached) return cached;
 
   const token = await getPersonioToken(env, redis);
 
-  // v1 employees endpoint supports email filter :contentReference[oaicite:11]{index=11}
-  const url = `${env.PERSONIO_BASE_URL}/v1/company/employees?email=${encodeURIComponent(email)}`;
-  const { status, json, text } = await httpJson(url, {
+  // Employee API email filter exists on v1/company/employees :contentReference[oaicite:2]{index=2}
+  const url = `${env.PERSONIO_BASE_URL}/v1/company/employees?limit=1&offset=0&email=${encodeURIComponent(email)}`;
+  const r = await fetch(url, {
     method: "GET",
     headers: {
       "accept": "application/json",
@@ -76,81 +76,86 @@ export async function getEmployeeIdByEmail(env: Env, redis: RedisClient, email: 
     }
   });
 
-  if (status >= 300) {
-    log("warn", "personio.employee_lookup_failed", { status, email });
+  const txt = await r.text();
+  if (!r.ok) {
+    log("warn", "personio.employee_lookup_failed", { email, status: r.status });
     return null;
   }
 
-  const arr = json?.data;
-  const emp = Array.isArray(arr) ? arr[0] : null;
-  const id = emp?.attributes?.id?.value ?? emp?.attributes?.id ?? emp?.id ?? null;
+  const json = JSON.parse(txt) as any;
+  const first = json?.data?.[0];
 
-  const employeeId = id ? String(id) : null;
-  if (!employeeId) return null;
+  // try multiple shapes
+  const idVal =
+    first?.attributes?.id?.value ??
+    first?.id?.value ??
+    first?.attributes?.id ??
+    first?.id;
 
-  // cache 24h
-  await redis.set(key, employeeId, "PX", 24 * 3600 * 1000);
-  return employeeId;
-}
+  if (idVal === undefined || idVal === null) return null;
 
-export async function createAttendance(env: Env, redis: RedisClient, employeeId: string, startBerlin: string, endBerlin: string): Promise<string> {
-  if (env.SHADOW_MODE) {
-    log("info", "personio.shadow_skip_create", { employeeId, start: startBerlin, end: endBerlin });
-    return "shadow-period";
-  }
-
-  const token = await getPersonioToken(env, redis);
-
-  // v2 create attendance period :contentReference[oaicite:12]{index=12}
-  const url = `${env.PERSONIO_BASE_URL}/v2/attendance-periods?skip_approval=${env.PERSONIO_SKIP_APPROVAL ? "true" : "false"}`;
-  const payload = {
-    person: { id: employeeId },
-    type: "WORK",
-    start: { date_time: startBerlin },
-    end: { date_time: endBerlin }
-  };
-
-  const { status, json, text } = await httpJson(url, {
-    method: "POST",
-    headers: {
-      "accept": "application/json",
-      "content-type": "application/json",
-      "authorization": `Bearer ${token}`
-    },
-    body: JSON.stringify(payload)
-  });
-
-  if (status >= 300) {
-    throw new Error(`Personio create attendance failed ${status}: ${text}`);
-  }
-
-  const id = String(json?.data?.id ?? json?.id ?? "");
-  if (!id) throw new Error(`Personio create attendance missing id: ${text}`);
+  const id = String(idVal);
+  await redis.set(cacheKey, id, { EX: 7 * 24 * 3600 });
   return id;
 }
 
-export async function patchAttendanceEnd(env: Env, redis: RedisClient, periodId: string, endBerlin: string): Promise<void> {
-  if (env.SHADOW_MODE) {
-    log("info", "personio.shadow_skip_patch_end", { periodId, end: endBerlin });
-    return;
-  }
+export async function createAttendanceOpenEnded(env: Env, redis: Redis, employeeId: string, startLocalBerlin: string): Promise<string> {
   const token = await getPersonioToken(env, redis);
 
-  // v2 patch attendance period by id :contentReference[oaicite:13]{index=13}
-  const url = `${env.PERSONIO_BASE_URL}/v2/attendance-periods/${encodeURIComponent(periodId)}?skip_approval=${env.PERSONIO_SKIP_APPROVAL ? "true" : "false"}`;
-  const payload = { end: { date_time: endBerlin } };
+  const headers: Record<string, string> = {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "authorization": `Bearer ${token}`
+  };
+  if (env.PERSONIO_BETA_HEADER) headers["Beta"] = "true";
 
-  const { status, text } = await httpJson(url, {
-    method: "PATCH",
-    headers: {
-      "accept": "application/json",
-      "content-type": "application/json",
-      "authorization": `Bearer ${token}`
-    },
+  // v2 attendance-periods accepts open-ended end (or missing) :contentReference[oaicite:3]{index=3}
+  const payload = {
+    person: { id: employeeId },
+    type: "WORK",
+    start: { date_time: startLocalBerlin },
+    comment: "TimeMoto"
+  };
+
+  const qs = env.PERSONIO_SKIP_APPROVAL ? "?skip_approval=true" : "";
+  const r = await personioFetch(env, `/v2/attendance-periods${qs}`, {
+    method: "POST",
+    headers,
     body: JSON.stringify(payload)
   });
 
-  if (status >= 300) {
-    throw new Error(`Personio patch attendance failed ${status}: ${text}`);
-  }
+  const txt = await r.text();
+  if (!r.ok) throw new Error(`Personio create attendance failed ${r.status}: ${txt}`);
+
+  // Try to extract id robustly
+  const json = JSON.parse(txt) as any;
+  const id = json?.data?.id ?? json?.id ?? json?.data?.attributes?.id;
+  if (!id) throw new Error(`Personio create returned no id: ${txt}`);
+  return String(id);
+}
+
+export async function patchAttendanceEnd(env: Env, redis: Redis, periodId: string, endLocalBerlin: string): Promise<void> {
+  const token = await getPersonioToken(env, redis);
+
+  const headers: Record<string, string> = {
+    "accept": "application/json",
+    "content-type": "application/json",
+    "authorization": `Bearer ${token}`
+  };
+  if (env.PERSONIO_BETA_HEADER) headers["Beta"] = "true";
+
+  const payload = {
+    end: { date_time: endLocalBerlin }
+  };
+
+  const qs = env.PERSONIO_SKIP_APPROVAL ? "?skip_approval=true" : "";
+  const r = await personioFetch(env, `/v2/attendance-periods/${encodeURIComponent(periodId)}${qs}`, {
+    method: "PATCH",
+    headers,
+    body: JSON.stringify(payload)
+  });
+
+  const txt = await r.text();
+  // PATCH often returns 204 with empty body (ok)
+  if (!r.ok) throw new Error(`Personio patch end failed ${r.status}: ${txt}`);
 }
