@@ -1,40 +1,43 @@
 import type { Env } from "./env";
-import type { RedisClient } from "./redis";
+import type { Redis } from "./redis";
 import { log } from "./log";
+import { listDueAutoClose, getOpenSession, clearOpenSession, pushHistory } from "./session";
 import { patchAttendanceEnd } from "./personio";
-import { clearOpen, getOpen, pushHistory } from "./session";
-import { toBerlinLocalNoOffset } from "./timemoto";
+import { toBerlinISO } from "./timemoto";
+import { recordAnomaly } from "./anomalies";
 
-const AUTOCLOSE_ZSET = "session:autoclose";
-
-export async function runAutoClose(env: Env, redis: RedisClient): Promise<{ closed: number }> {
+export async function runAutoClose(env: Env, redis: Redis): Promise<{ closed: number }> {
   const now = Date.now();
-  // get up to 50 due sessions
-  const emails = await redis.zrangebyscore(AUTOCLOSE_ZSET, 0, now, "LIMIT", 0, 50);
+  const dueEmails = await listDueAutoClose(redis, now, 50);
+
   let closed = 0;
 
-  for (const email of emails) {
-    const s = await getOpen(redis, email);
-    if (!s) {
-      await redis.zrem(AUTOCLOSE_ZSET, email);
+  for (const email of dueEmails) {
+    const open = await getOpenSession(redis, email);
+    if (!open) {
+      await clearOpenSession(redis, email);
       continue;
     }
-    if (s.autoCloseAtUtc > now) continue;
 
-    const endBerlin = toBerlinLocalNoOffset(s.autoCloseAtUtc);
+    // close at stored autoCloseAtUtcMs (hard cap)
+    const endBerlin = toBerlinISO(open.autoCloseAtUtcMs);
 
-    await patchAttendanceEnd(env, redis, s.periodId, endBerlin);
-    await pushHistory(redis, email, {
-      start: s.startBerlin,
-      end: endBerlin,
-      end_reason: "AUTO_CLOSE",
-      periodId: s.periodId,
-      openedEventId: s.openedEventId,
-      ts: new Date().toISOString()
-    });
-    await clearOpen(redis, email);
-    closed++;
-    log("info", "attendance.autoclosed", { email, periodId: s.periodId, end: endBerlin });
+    try {
+      if (!env.SHADOW_MODE) {
+        await patchAttendanceEnd(env, redis, open.personioPeriodId, endBerlin);
+      } else {
+        log("info", "personio.shadow_skip_patch_end", { email, periodId: open.personioPeriodId, end: endBerlin });
+      }
+
+      await pushHistory(redis, { email, start: open.startBerlinISO, end: endBerlin, reason: "AUTO_CLOSE", periodId: open.personioPeriodId });
+      await clearOpenSession(redis, email);
+
+      closed++;
+      log("info", "attendance.auto_closed", { email, start: open.startBerlinISO, end: endBerlin, periodId: open.personioPeriodId });
+    } catch (e: any) {
+      await recordAnomaly(redis, { type: "AUTO_CLOSE_FAILED", email, details: { err: String(e?.message ?? e) } });
+      log("error", "attendance.auto_close_failed", { email, err: String(e?.message ?? e) });
+    }
   }
 
   return { closed };
