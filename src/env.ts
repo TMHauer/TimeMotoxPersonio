@@ -6,6 +6,7 @@ export type Env = {
   // TimeMoto
   TIMEMOTO_WEBHOOK_SECRET: string;
   ALLOW_INVALID_SIGNATURE: boolean;
+  WEBHOOK_PATH_TOKEN?: string;
 
   // Personio
   PERSONIO_CLIENT_ID: string;
@@ -39,6 +40,7 @@ export function loadEnv(): Env {
 
     TIMEMOTO_WEBHOOK_SECRET: must("TIMEMOTO_WEBHOOK_SECRET"),
     ALLOW_INVALID_SIGNATURE: bool("ALLOW_INVALID_SIGNATURE", false),
+    WEBHOOK_PATH_TOKEN: process.env.WEBHOOK_PATH_TOKEN?.trim() || undefined,
 
     PERSONIO_CLIENT_ID: must("PERSONIO_CLIENT_ID"),
     PERSONIO_CLIENT_SECRET: must("PERSONIO_CLIENT_SECRET"),
